@@ -1,0 +1,14 @@
+{
+  "name": "Review Queue",
+  "folder": "Captures",
+  "columns": [
+    { "id": "file", "name": "Note", "width": 300 },
+    { "id": "date", "name": "Captured", "type": "date", "width": 120, "sort": "desc" },
+    { "id": "note_type", "name": "Type", "width": 100 },
+    { "id": "needs_review", "name": "Review?", "type": "boolean", "width": 80 }
+  ],
+  "filters": [
+    { "column": "needs_review", "operator": "is", "value": true }
+  ],
+  "version": "1.0"
+}

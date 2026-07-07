@@ -1,0 +1,12 @@
+{
+  "name": "Capture Feed",
+  "folder": "Captures",
+  "columns": [
+    { "id": "file", "name": "Note", "width": 300 },
+    { "id": "date", "name": "Captured", "type": "date", "width": 120, "sort": "desc" },
+    { "id": "note_type", "name": "Type", "width": 100 },
+    { "id": "tags", "name": "Tags", "type": "tags", "width": 200 }
+  ],
+  "filters": [],
+  "version": "1.0"
+}

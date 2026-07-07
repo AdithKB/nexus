@@ -1,0 +1,23 @@
+[Unit]
+Description=Obsidian Capture Pipeline Server
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/AgenticPKMApp
+
+# ── Fill in your keys here ────────────────────────────────────
+Environment="GEMINI_API_KEY=your-gemini-api-key"
+Environment="GROQ_API_KEY=your-groq-api-key"
+# OBSIDIAN_VAULT is irrelevant on the server (return_files mode only)
+Environment="OBSIDIAN_VAULT=/tmp/void"
+
+ExecStart=/home/ubuntu/AgenticPKMApp/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

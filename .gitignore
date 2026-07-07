@@ -1,0 +1,19 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# local state / caches
+*.db
+*.log
+*.json.bak
+
+# claude / agent tool configs (local only)
+.claude/

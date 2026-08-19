@@ -13,6 +13,7 @@ Run: python tools/test_new_features.py
 import asyncio
 import json
 import math
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -156,8 +157,10 @@ async def test_embed_store():
     print("\n── 3. EmbedStore.get_all_with_embeddings (Ollama) ───────────")
     from embed_store import EmbedStore, EMBED_DIM
 
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        db_path = Path(f.name)
+    # LanceDB needs a path that doesn't exist yet (it mkdir's it) — NamedTemporaryFile
+    # would create a real file there first, which trips LanceDB's mkdir(exist_ok=True)
+    # since exist_ok only tolerates an existing directory, not an existing file.
+    db_path = Path(tempfile.mkdtemp()) / "embed_test.db"
 
     store = EmbedStore(db_path=db_path)
 
@@ -202,7 +205,7 @@ async def test_embed_store():
               for r in all_with_emb))
 
     store.close()
-    db_path.unlink(missing_ok=True)
+    shutil.rmtree(db_path, ignore_errors=True)  # LanceDB db_path is a directory, not a file
     return all_with_emb  # pass to dreamer test
 
 

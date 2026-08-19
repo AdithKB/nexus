@@ -9,28 +9,15 @@ Usage:
     python3 scripts/find_duplicates.py [--threshold 0.70] [--output report.md]
 """
 import argparse
-import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from _dedup_common import title_tokens, jaccard
+
 VAULT = Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Nexus"
 CAPTURES = VAULT / "Captures"
-
-STOPWORDS = {"a", "an", "the", "and", "or", "of", "in", "to", "for", "with",
-             "on", "at", "by", "from", "is", "are", "was", "were", "be",
-             "that", "this", "as", "it", "its", "not", "but", "can", "do"}
-
-
-def title_tokens(title: str) -> set[str]:
-    words = re.findall(r"[a-zA-Z0-9']+", title.lower())
-    return {w for w in words if w not in STOPWORDS and len(w) > 2}
-
-
-def jaccard(a: set, b: set) -> float:
-    if not a or not b:
-        return 0.0
-    return len(a & b) / len(a | b)
 
 
 def find_duplicate_clusters(threshold: float = 0.70):

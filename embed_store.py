@@ -14,8 +14,12 @@ Embedding model: Qwen3-Embedding-4B via Ollama (256-dim Matryoshka truncation).
 """
 import hashlib
 import math
+import re
+import unicodedata
 from pathlib import Path
 from typing import Optional
+
+from config import ILLEGAL_FILENAME_CHARS
 
 try:
     import numpy as np
@@ -30,6 +34,33 @@ MODEL_ID   = "qwen3-embedding:4b"
 LANCE_DIR  = Path.home() / ".nexus_lancedb"
 LEGACY_DB  = Path.home() / ".nexus_embed.db"   # migrated on first run
 
+_ILLEGAL_CHARS = ILLEGAL_FILENAME_CHARS
+
+
+def _slugify_title(title: str) -> str:
+    """
+    Same normalization as vault.slugify() — duplicated here (not imported)
+    because processor.py imports EmbedStore, and vault.py imports processor.py,
+    so `from vault import slugify` would create a circular import.
+
+    Titles stored here MUST match vault.slugify(note.title) exactly, since
+    that's what write_to_vault() uses for the actual filename. A mismatch
+    (e.g. a title containing "/") makes Dreamer's latent-link suggestions
+    point at wikilinks that don't resolve to any real file.
+    """
+    s = title.strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", "ignore").decode("ascii")
+    s = s.replace("/", " ")
+    s = _ILLEGAL_CHARS.sub("", s)
+    s = re.sub(r"[\s_]+", " ", s)
+    s = s.strip(" _.")
+    if s:
+        s = s[0].upper() + s[1:]
+    if len(s) > 120:
+        s = s[:120].rsplit(" ", 1)[0]
+    return s.strip() or "Untitled"
+
 
 # ── Math helpers (module-level — used by dreamer.py) ─────────
 
@@ -43,7 +74,6 @@ def cosine(a, b) -> float:
     denom = _norm(a) * _norm(b)
     return _dot(a, b) / denom if denom else 0.0
 
-_cosine = cosine   # backward-compat alias for dreamer.py
 
 
 # ── Embedding (async, Ollama) ─────────────────────────────────
@@ -266,22 +296,22 @@ class EmbedStore:
         Returns the number of notes actually embedded.
         """
         # Phase 1: filter to only notes that need re-embedding
-        pending: list[tuple[dict, str, str]] = []   # (note, embed_text, chash)
+        pending: list[tuple[dict, str, str, str]] = []   # (note, embed_text, chash, title)
         for note in notes:
-            title = note.get("title", "").strip()
-            if not title:
+            if not note.get("title", "").strip():
                 continue
+            title = _slugify_title(note["title"])
             embed_text = self._make_embed_text(note)
             chash = self._content_hash(embed_text)
             if not force and self._hash_cache.get(title) == chash:
                 continue
-            pending.append((note, embed_text, chash))
+            pending.append((note, embed_text, chash, title))
 
         if not pending:
             return 0
 
         # Phase 2: one batch embed call for all pending notes
-        titles_str = ", ".join(n[0].get("title", "") for n in pending)
+        titles_str = ", ".join(p[3] for p in pending)
         print(f"[EMBED] batch({len(pending)}): {titles_str[:80]}", flush=True)
         try:
             vectors = await _embed_texts([p[1] for p in pending], keep_alive=keep_alive)
@@ -291,9 +321,9 @@ class EmbedStore:
 
         # Phase 3: build records and upsert
         to_upsert = []
-        for (note, _, chash), vector in zip(pending, vectors):
+        for (note, _, chash, title), vector in zip(pending, vectors):
             to_upsert.append({
-                "title":        note.get("title", "").strip(),
+                "title":        title,
                 "aliases":      ",".join(note.get("aliases", [])),
                 "tags":         ",".join(note.get("tags", [])),
                 "note_type":    note.get("note_type", ""),

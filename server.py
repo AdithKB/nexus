@@ -38,10 +38,10 @@ from fastapi.responses import JSONResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
-from capture import _c, build_config, run_pipeline, validate_key
+from capture import _c, build_config, run_pipeline
 from embed_store import EmbedStore
 from extractors import extract_source
-from processor import process_source, run_relay_stage
+from processor import run_relay_stage, run_crystallizer_stage
 from vault import build_vault_files
 
 
@@ -69,6 +69,39 @@ def _signal_seedling_available():
     # ensuring the waiting coroutine always sees the event before it's cleared.
 
 
+_MP4_FILENAME_RE = re.compile(r'^[\w\-\.]+\.mp4$')
+
+
+def _spaces_ready(config) -> bool:
+    """Whether DigitalOcean Spaces credentials are configured and boto3 is available."""
+    return bool(_BOTO3_AVAILABLE and config.spaces_access_key
+                and config.spaces_secret_key and config.spaces_bucket)
+
+
+def _get_config_safe():
+    """Load Config(), or None on failure."""
+    try:
+        from config import Config
+        return Config()
+    except Exception:
+        return None
+
+
+async def _parse_json_body(request: Request) -> dict:
+    """Parse a request body as JSON. Raises HTTPException(400) on empty/invalid body."""
+    raw = await request.body()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty request body")
+    try:
+        return _json.loads(raw.decode("utf-8"))
+    except Exception:
+        pass
+    try:
+        return _json.loads(raw)  # raw bytes are already JSON (some clients skip utf-8 decode)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+
 # ── Job persistence ───────────────────────────────────────────
 
 _JOBS_PATH = Path.home() / ".nexus_jobs.json"
@@ -76,38 +109,47 @@ _INDEX_PATH = Path.home() / ".nexus_vault_index.json"
 _MAX_PERSISTED_JOBS = 100  # keep last N completed jobs on disk
 
 
+def _persist_json(path: Path, data, log_tag: str) -> None:
+    """Write JSON to path, logging (not raising) on failure."""
+    try:
+        path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[{log_tag}] Write failed: {e}", flush=True)
+
+
+def _load_json(path: Path, log_tag: str):
+    """Read JSON from path. Returns None on missing file or parse failure (logged)."""
+    try:
+        return _json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None  # first run
+    except Exception as e:
+        print(f"[{log_tag}] Load failed: {e}", flush=True)
+        return None
+
+
 def _persist_jobs():
     """Write _jobs + _latest_job_id to disk. Keeps last _MAX_PERSISTED_JOBS."""
-    try:
-        # Only persist completed/failed jobs (not in-progress ones)
-        to_save = {
-            jid: job for jid, job in _jobs.items()
-            if job.get("status") != "processing"
-        }
-        # Trim to last N by keeping insertion order (Python 3.7+)
-        if len(to_save) > _MAX_PERSISTED_JOBS:
-            excess = len(to_save) - _MAX_PERSISTED_JOBS
-            to_save = dict(list(to_save.items())[excess:])
-        _JOBS_PATH.write_text(
-            _json.dumps({"latest_job_id": _latest_job_id, "jobs": to_save}, indent=2),
-            encoding="utf-8",
-        )
-    except Exception as e:
-        print(f"[PERSIST] Write failed: {e}", flush=True)
+    # Only persist completed/failed jobs (not in-progress ones)
+    to_save = {
+        jid: job for jid, job in _jobs.items()
+        if job.get("status") != "processing"
+    }
+    # Trim to last N by keeping insertion order (Python 3.7+)
+    if len(to_save) > _MAX_PERSISTED_JOBS:
+        excess = len(to_save) - _MAX_PERSISTED_JOBS
+        to_save = dict(list(to_save.items())[excess:])
+    _persist_json(_JOBS_PATH, {"latest_job_id": _latest_job_id, "jobs": to_save}, "PERSIST")
 
 
 def _load_persisted_jobs():
     """Load jobs from disk into _jobs on startup."""
     global _jobs, _latest_job_id
-    try:
-        data = _json.loads(_JOBS_PATH.read_text(encoding="utf-8"))
+    data = _load_json(_JOBS_PATH, "PERSIST")
+    if data is not None:
         _jobs = data.get("jobs", {})
         _latest_job_id = data.get("latest_job_id")
         print(f"[PERSIST] Loaded {len(_jobs)} jobs, latest={_latest_job_id}", flush=True)
-    except FileNotFoundError:
-        pass  # first run
-    except Exception as e:
-        print(f"[PERSIST] Load failed: {e}", flush=True)
 
 
 # ── Vault index persistence ───────────────────────────────────
@@ -115,22 +157,16 @@ def _load_persisted_jobs():
 
 def _persist_vault_index():
     """Write _vault_index to disk so it survives server restarts."""
-    try:
-        _INDEX_PATH.write_text(_json.dumps(_vault_index), encoding="utf-8")
-    except Exception as e:
-        print(f"[INDEX] Persist failed: {e}", flush=True)
+    _persist_json(_INDEX_PATH, _vault_index, "INDEX")
 
 
 def _load_vault_index():
     """Load vault index from disk on startup."""
     global _vault_index
-    try:
-        _vault_index = _json.loads(_INDEX_PATH.read_text(encoding="utf-8"))
+    data = _load_json(_INDEX_PATH, "INDEX")
+    if data is not None:
+        _vault_index = data
         print(f"[INDEX] Loaded {len(_vault_index)} notes from disk", flush=True)
-    except FileNotFoundError:
-        pass  # first run
-    except Exception as e:
-        print(f"[INDEX] Load failed: {e}", flush=True)
 
 
 # ── DigitalOcean Spaces upload ────────────────────────────────
@@ -147,19 +183,41 @@ def _spaces_client(config):
     )
 
 
+_MOC_NOTES_HEADER = "## Notes"
+_MOC_LINK_RE = re.compile(r"^- \[\[.+\]\]\s*$", re.MULTILINE)
+
+
+def _merge_moc_links(existing: str, incoming: str) -> str:
+    """
+    Merge incoming's '- [[...]]' links into an existing MOC's content instead of
+    overwriting it. Two back-to-back captures on the same topic each build a
+    complete "MOC doesn't exist yet" version independently (server has no shared
+    vault state) — without this, whichever job's PUT lands second on Spaces
+    would silently erase the first job's MOC links. Mirrors vault_writer.py's
+    _merge_moc_content(); duplicated here since server.py (droplet) and
+    vault_writer.py (Mac) never share a runtime to import from.
+    """
+    if _MOC_NOTES_HEADER not in existing:
+        existing = existing.rstrip("\n") + f"\n\n{_MOC_NOTES_HEADER}\n"
+    for link in _MOC_LINK_RE.findall(incoming):
+        link = link.strip()
+        if link not in existing:
+            existing = existing.rstrip("\n") + f"\n{link}\n"
+    return existing
+
+
 async def _upload_to_spaces(files: dict, config) -> int:
     """
     Upload completed vault files to DigitalOcean Spaces.
 
     Captures and Sources are uploaded directly (unique per job).
-    MOCs use a per-filename asyncio lock to prevent concurrent overwrites —
-    MOC content is idempotent (Dataview query) so the lock is belt-and-suspenders.
+    MOCs read-merge-write under a per-filename asyncio lock: two concurrent
+    captures on the same topic each merge their links into whatever is
+    currently live on Spaces instead of racing to overwrite each other.
 
     Returns number of files uploaded. Silently skips if Spaces not configured.
     """
-    if not _BOTO3_AVAILABLE:
-        return 0
-    if not all([config.spaces_access_key, config.spaces_secret_key, config.spaces_bucket]):
+    if not _spaces_ready(config):
         return 0
 
     loop = asyncio.get_event_loop()
@@ -171,6 +229,16 @@ async def _upload_to_spaces(files: dict, config) -> int:
             Body=content.encode("utf-8"),
             ContentType="text/markdown; charset=utf-8",
         )
+
+    def _get(client, spaces_key):
+        try:
+            obj = client.get_object(Bucket=config.spaces_bucket, Key=spaces_key)
+            return obj["Body"].read().decode("utf-8")
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "404"):
+                return None
+            raise
 
     uploaded = 0
     s3 = _spaces_client(config)
@@ -189,7 +257,7 @@ async def _upload_to_spaces(files: dict, config) -> int:
             except (BotoCoreError, ClientError) as e:
                 print(f"[SPACES] Upload failed for {spaces_key}: {e}", flush=True)
 
-    # MOCs: serialise per filename to prevent concurrent overwrites
+    # MOCs: read-merge-write, serialized per filename
     for item in files.get("mocs", []):
         filename = item.get("filename", "")
         content  = item.get("content", "")
@@ -200,6 +268,9 @@ async def _upload_to_spaces(files: dict, config) -> int:
         spaces_key = f"{config.spaces_prefix}/MOCs/{filename}"
         async with _moc_locks[filename]:
             try:
+                existing = await loop.run_in_executor(None, _get, s3, spaces_key)
+                if existing:
+                    content = _merge_moc_links(existing, content)
                 await loop.run_in_executor(None, _put, s3, spaces_key, content)
                 uploaded += 1
             except (BotoCoreError, ClientError) as e:
@@ -224,7 +295,7 @@ async def _upload_review_video(video_path: str, source_id: str, config) -> None:
     """
     if not _BOTO3_AVAILABLE:
         return
-    if not all([config.spaces_access_key, config.spaces_secret_key, config.spaces_bucket]):
+    if not _spaces_ready(config):
         Path(video_path).unlink(missing_ok=True)
         return
 
@@ -266,6 +337,13 @@ _embed_store: EmbedStore | None = None  # semantic search index (lazy init)
 _dedup_gate = None  # DedupGate — set in main()
 _moc_locks: dict[str, asyncio.Lock] = {}  # per-MOC filename lock for safe concurrent uploads
 
+# Bounds concurrent full-pipeline runs (Stage 1 + Stage 2 Gemini calls) so
+# posting several captures back-to-back queues behind this instead of firing
+# an unbounded burst at the Gemini API — a burst risks rate-limit failures,
+# which is what actually causes a capture to silently never land in the vault.
+_JOB_CONCURRENCY_LIMIT = 2
+_job_semaphore = asyncio.Semaphore(_JOB_CONCURRENCY_LIMIT)
+
 
 # ── Request / Response models ─────────────────────────────────
 
@@ -291,92 +369,104 @@ async def _process_job(job_id: str, url: str, config, user_intent: str = ""):
     Run multimodal extraction via Gemini 3.1 Flash-Lite and save as a Seedling.
     """
     try:
-        from processor import run_relay_stage
+        async with _job_semaphore:
+            print(f"[JOB {job_id}] RELAY: Starting Stage 1 for {url}", flush=True)
+            meta = extract_source(url, config)
 
-        print(f"[JOB {job_id}] RELAY: Starting Stage 1 for {url}", flush=True)
-        meta = extract_source(url, config)
+            # Semantic dedup — runs after extraction, before Gemini (saves API cost)
+            if _dedup_gate and config.dedup_enabled and meta.transcript:
+                verdict, matched = _dedup_gate.check(url, meta.transcript[:4000])
+                if verdict == "skip":
+                    print(f"[JOB {job_id}] DEDUP: Duplicate content. Matched: {matched}", flush=True)
+                    _jobs[job_id] = {
+                        "status": "completed",
+                        "result": {"status": "duplicate", "matched": matched, "error": None},
+                    }
+                    _persist_jobs()
+                    return
+                if verdict == "flag":
+                    meta.related_captures = matched
+                    print(f"[JOB {job_id}] DEDUP: Related content: {matched}", flush=True)
 
-        # Semantic dedup — runs after extraction, before Gemini (saves API cost)
-        if _dedup_gate and config.dedup_enabled and meta.transcript:
-            verdict, matched = _dedup_gate.check(url, meta.transcript[:4000])
-            if verdict == "skip":
-                print(f"[JOB {job_id}] DEDUP: Duplicate content. Matched: {matched}", flush=True)
+            # 1. Run Relay (Gemini Cloud)
+            description = await run_relay_stage(meta, config)
+
+            if config.llm_provider == "gemini":
+                # Full-cloud capture: Stage 2 also runs here via Gemini, skipping the
+                # Mac/Ollama entirely. Finished note files go straight to Spaces for
+                # vault_writer.py — or the phone's Remotely Save plugin, independent
+                # of the Mac being on — to pull. No seedling, no waiting.
+                # embed_store=None: run_crystallizer_stage never actually reads this
+                # param, and indexing here would write into the droplet's own throwaway
+                # LanceDB, not the Mac's — the Mac's own reindex picks these up normally.
+                result = await run_crystallizer_stage(description, meta, config, None, user_intent)
+                files = build_vault_files(result, meta, config)
+                uploaded = await _upload_to_spaces(files, config)
+
+                print(
+                    f"[JOB {job_id}] CLOUD: Stage 2 complete via Gemini — "
+                    f"{len(result.atomic_notes)} notes, {uploaded} file(s) uploaded.",
+                    flush=True,
+                )
+
+                if _dedup_gate and meta.transcript:
+                    _dedup_gate.index(url, meta.transcript[:4000], title=meta.title or url)
+
                 _jobs[job_id] = {
                     "status": "completed",
-                    "result": {"status": "duplicate", "matched": matched, "error": None},
+                    "result": {
+                        "status": "captured",
+                        "url": url,
+                        "notes_created": len(result.atomic_notes),
+                        "provider": "gemini",
+                        "error": None,
+                    },
                 }
                 _persist_jobs()
+
+                if meta.video_path and Path(meta.video_path).exists():
+                    await _upload_review_video(meta.video_path, meta.source_id, config)
                 return
-            if verdict == "flag":
-                meta.related_captures = matched
-                print(f"[JOB {job_id}] DEDUP: Related content: {matched}", flush=True)
 
-        # 1. Run Relay (Gemini Cloud)
-        description = await run_relay_stage(meta, config)
-
-        
-        # 2. Build Seedling Package
-        seedling = {
-            "version": "4.0",
-            "job_id": job_id,
-            "url": url,
-            "user_intent": user_intent,
-            "timestamp": time.time(),
-            "meta": {
-                "title": meta.title,
-                "author": meta.author,
-                "source_type": meta.source_type,
-                "duration_sec": meta.duration_sec,
-                "transcript": meta.transcript, # Include raw transcript for local cross-ref
-                "source_id": meta.source_id
-            },
-            "relay_description": description
-        }
-
-        # 3. Save Seedling locally
-        seedling_path = Path.home() / f".nexus_seedlings/{job_id}.seedling.json"
-        seedling_path.parent.mkdir(parents=True, exist_ok=True)
-        seedling_text = _json.dumps(seedling, indent=2)
-        seedling_path.write_text(seedling_text, encoding="utf-8")
-        
-        # 4. Upload to Spaces (incoming/) so vault_writer pulls it to Mac
-        if _BOTO3_AVAILABLE and all([config.spaces_access_key, config.spaces_secret_key, config.spaces_bucket]):
-            try:
-                s3 = _spaces_client(config)
-                # Save as a .json file in the incoming prefix
-                s3_key = f"{config.spaces_prefix.rstrip('/')}/seedling_{job_id}.json"
-                s3.put_object(
-                    Bucket=config.spaces_bucket,
-                    Key=s3_key,
-                    Body=seedling_text,
-                    ContentType="application/json",
-                    ACL="private"
-                )
-                _signal_seedling_available()
-                print(f"[JOB {job_id}] RELAY: Seedling uploaded to Spaces.", flush=True)
-            except Exception as e:
-                print(f"[JOB {job_id}] RELAY: Spaces upload failed: {e}", flush=True)
-
-        print(f"[JOB {job_id}] RELAY: Stage 1 Complete.", flush=True)
-
-        # Index for future dedup checks
-        if _dedup_gate and meta.transcript:
-            _dedup_gate.index(url, meta.transcript[:4000], title=meta.title or url)
-
-        _jobs[job_id] = {
-            "status": "completed",
-            "result": {
-                "status": "relay_complete",
+            # 2. Build Seedling Package and upload to Spaces (incoming/) so vault_writer pulls it to Mac
+            seedling = {
+                "version": "4.0",
+                "job_id": job_id,
                 "url": url,
-                "seedling_id": job_id,
-                "error": None,
-            },
-        }
-        _persist_jobs()
+                "user_intent": user_intent,
+                "timestamp": time.time(),
+                "meta": {
+                    "title": meta.title,
+                    "author": meta.author,
+                    "source_type": meta.source_type,
+                    "duration_sec": meta.duration_sec,
+                    "transcript": meta.transcript, # Include raw transcript for local cross-ref
+                    "source_id": meta.source_id
+                },
+                "relay_description": description
+            }
+            await _put_seedling_to_spaces(job_id, _json.dumps(seedling, indent=2), config)
 
-        # Upload video for quality review, then clean up
-        if meta.video_path and Path(meta.video_path).exists():
-            await _upload_review_video(meta.video_path, meta.source_id, config)
+            print(f"[JOB {job_id}] RELAY: Stage 1 Complete.", flush=True)
+
+            # Index for future dedup checks
+            if _dedup_gate and meta.transcript:
+                _dedup_gate.index(url, meta.transcript[:4000], title=meta.title or url)
+
+            _jobs[job_id] = {
+                "status": "completed",
+                "result": {
+                    "status": "relay_complete",
+                    "url": url,
+                    "seedling_id": job_id,
+                    "error": None,
+                },
+            }
+            _persist_jobs()
+
+            # Upload video for quality review, then clean up
+            if meta.video_path and Path(meta.video_path).exists():
+                await _upload_review_video(meta.video_path, meta.source_id, config)
 
     except Exception as e:
         _jobs[job_id] = {
@@ -428,25 +518,7 @@ async def _background_embed_update(notes: list[dict]):
 
 @app.post("/capture")
 async def capture(request: Request):
-    raw = await request.body()
-    if not raw:
-        raise HTTPException(status_code=400, detail="Empty request body")
-
-    body = None
-    # Attempt 1: Standard UTF-8 JSON parse
-
-    try:
-        body = _json.loads(raw.decode("utf-8"))
-    except Exception:
-        pass
-
-    # Attempt 2: If raw bytes are just the JSON (common in 'File' body type)
-    if body is None:
-        try:
-            body = _json.loads(raw)
-        except Exception:
-            # Final desperate attempt: is it multi-part?
-            raise HTTPException(status_code=400, detail="Invalid JSON body")
+    body = await _parse_json_body(request)
 
     # iOS Shortcuts sends booleans as 0/1 — normalize return_files
     rf = body.get("return_files", False)
@@ -558,11 +630,7 @@ async def research_topic(request: Request):
     Does NO AI processing — just saves a request JSON to Spaces and returns immediately.
     vault_writer.py detects research_request_*.json and calls research_topic locally.
     """
-    raw = await request.body()
-    try:
-        body = _json.loads(raw.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    body = await _parse_json_body(request)
 
     topic_intent = body.get("topic_intent", "").strip()
     if not topic_intent:
@@ -583,7 +651,7 @@ async def research_topic(request: Request):
     })
 
     async def _upload_research_request():
-        if not (_BOTO3_AVAILABLE and config.spaces_access_key):
+        if not _spaces_ready(config):
             return
         loop = asyncio.get_event_loop()
         s3 = _spaces_client(config)
@@ -611,8 +679,7 @@ async def research_topic(request: Request):
 
 async def _put_seedling_to_spaces(job_id: str, seedling_text: str, config) -> bool:
     """Upload a seedling JSON to DigitalOcean Spaces. Returns True on success."""
-    if not (_BOTO3_AVAILABLE and config.spaces_access_key
-            and config.spaces_secret_key and config.spaces_bucket):
+    if not _spaces_ready(config):
         return False
     loop = asyncio.get_event_loop()
     s3 = _spaces_client(config)
@@ -644,11 +711,7 @@ async def capture_text(request: Request):
     Accepts {text, title?, user_intent?}.
     Skips Stage 1 extraction — the pasted text is used directly as the relay_description.
     """
-    raw = await request.body()
-    try:
-        body = _json.loads(raw.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    body = await _parse_json_body(request)
 
     text = body.get("text", "").strip()
     if not text:
@@ -730,11 +793,7 @@ async def capture_file(request: Request):
     Runs Stage 1 extraction on the file asynchronously, then uploads seedling to Spaces.
     Max practical size: ~15 MB (iOS Shortcuts limit).
     """
-    raw = await request.body()
-    try:
-        body = _json.loads(raw.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    body = await _parse_json_body(request)
 
     filename = body.get("filename", "document.pdf").strip()
     content_b64 = body.get("content_base64", "").strip()
@@ -773,7 +832,6 @@ async def _process_voice_job(job_id: str, audio_path: str, config, user_intent: 
     Transcribe via Groq Whisper → run_relay_stage → upload seedling to Spaces.
     """
     try:
-        from processor import run_relay_stage
         from extractors import extract_voice_memo
 
         meta = extract_voice_memo(Path(audio_path), config)
@@ -796,14 +854,7 @@ async def _process_voice_job(job_id: str, audio_path: str, config, user_intent: 
             },
             "relay_description": description,
         }
-        seedling_text = _json.dumps(seedling, indent=2)
-
-        if _BOTO3_AVAILABLE and all([config.spaces_access_key, config.spaces_secret_key, config.spaces_bucket]):
-            s3 = _spaces_client(config)
-            s3_key = f"{config.spaces_prefix.rstrip('/')}/seedling_{job_id}.json"
-            s3.put_object(Bucket=config.spaces_bucket, Key=s3_key,
-                          Body=seedling_text, ContentType="application/json", ACL="private")
-            _signal_seedling_available()
+        if await _put_seedling_to_spaces(job_id, _json.dumps(seedling, indent=2), config):
             print(f"[VOICE {job_id}] Seedling uploaded to Spaces.", flush=True)
 
         _jobs[job_id] = {"status": "completed",
@@ -853,7 +904,7 @@ async def _process_voice_fleeting_job(
             f"# {ts}\n\n{transcript.strip()}\n"
         )
 
-        if _BOTO3_AVAILABLE and all([config.spaces_access_key, config.spaces_secret_key, config.spaces_bucket]):
+        if _spaces_ready(config):
             s3 = _spaces_client(config)
             filename = f"{ts} fleeting.md"
             s3_key = f"{config.spaces_prefix.rstrip('/')}/Fleeting/{filename}"
@@ -940,7 +991,7 @@ async def _background_smart_capture(job_id: str, text: str, config):
         f"intent: {intent}\nneeds_synthesis: false\n---\n\n"
         f"# {ts}\n\n{text.strip()}\n"
     )
-    if _BOTO3_AVAILABLE and all([config.spaces_access_key, config.spaces_secret_key, config.spaces_bucket]):
+    if _spaces_ready(config):
         try:
             s3 = _spaces_client(config)
             s3_key = f"{config.spaces_prefix.rstrip('/')}/Fleeting/{ts} fleeting.md"
@@ -960,7 +1011,7 @@ async def _background_smart_capture(job_id: str, text: str, config):
             "search_query": text.strip(),
             "generate_synthesis": False,
         })
-        if _BOTO3_AVAILABLE and all([config.spaces_access_key, config.spaces_secret_key, config.spaces_bucket]):
+        if _spaces_ready(config):
             try:
                 s3 = _spaces_client(config)
                 s3_key = (
@@ -992,11 +1043,7 @@ async def capture_smart(request: Request):
     Detection is regex-only — no LLM call, no menu, no extra tap.
     Body: {"text": "...", "duration_hint": 0.0}
     """
-    raw = await request.body()
-    try:
-        body = _json.loads(raw.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    body = await _parse_json_body(request)
 
     text = body.get("text", "").strip()
     if not text:
@@ -1020,11 +1067,7 @@ async def capture_voice(request: Request):
     Transcribes via Groq Whisper → Stage 1 (Gemini relay) → seedling to Spaces → Stage 2 on Mac.
     Body: {"audio_b64": "<base64>", "user_intent": "optional context"}
     """
-    raw = await request.body()
-    try:
-        body = _json.loads(raw.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    body = await _parse_json_body(request)
 
     audio_b64 = body.get("audio_b64", "").strip()
     user_intent = body.get("user_intent", "")
@@ -1064,11 +1107,7 @@ async def capture_voice_fleeting(request: Request):
     Siri dictation path is preferred: free, on-device, zero upload overhead.
     Groq path is for ambient recordings where Siri's interactive UI is impractical.
     """
-    raw = await request.body()
-    try:
-        body = _json.loads(raw.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    body = await _parse_json_body(request)
 
     text      = body.get("text", "").strip()
     audio_b64 = body.get("audio_b64", "").strip()
@@ -1128,14 +1167,8 @@ async def get_pending():
     vault_writer.py polls this to pull new notes to the local vault.
     Returns: {"files": [{"path": "Captures/foo.md", "content": "..."}, ...]}
     """
-    if not _BOTO3_AVAILABLE:
-        return {"files": []}
-    try:
-        from config import Config
-        cfg = Config()
-    except Exception:
-        return {"files": []}
-    if not all([cfg.spaces_access_key, cfg.spaces_secret_key, cfg.spaces_bucket]):
+    cfg = _get_config_safe()
+    if not cfg or not _spaces_ready(cfg):
         return {"files": []}
 
     loop = asyncio.get_event_loop()
@@ -1182,14 +1215,8 @@ async def get_review():
     Returns: {"videos": [{"filename": "abc123.mp4", "size": 12345, "uploaded_at": 1234567890}]}
     vault_writer.py calls this to discover new review videos to download.
     """
-    if not _BOTO3_AVAILABLE:
-        return {"videos": []}
-    try:
-        from config import Config
-        cfg = Config()
-    except Exception:
-        return {"videos": []}
-    if not all([cfg.spaces_access_key, cfg.spaces_secret_key, cfg.spaces_bucket]):
+    cfg = _get_config_safe()
+    if not cfg or not _spaces_ready(cfg):
         return {"videos": []}
 
     loop = asyncio.get_event_loop()
@@ -1220,16 +1247,13 @@ async def download_review_video(filename: str):
     Serve a review video from Spaces review/ prefix.
     Returns raw video bytes with video/mp4 content type.
     """
-    import re
-    if not re.match(r'^[\w\-\.]+\.mp4$', filename):
+    if not _MP4_FILENAME_RE.match(filename):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
     if not _BOTO3_AVAILABLE:
         raise HTTPException(status_code=503, detail="Spaces not available")
-    try:
-        from config import Config
-        cfg = Config()
-    except Exception:
+    cfg = _get_config_safe()
+    if not cfg:
         raise HTTPException(status_code=503, detail="Config unavailable")
 
     loop = asyncio.get_event_loop()
@@ -1254,16 +1278,11 @@ async def delete_review_video(filename: str):
     Delete a review video from Spaces review/ prefix.
     vault_writer.py calls this after downloading + 10-min window expires.
     """
-    import re
-    if not re.match(r'^[\w\-\.]+\.mp4$', filename):
+    if not _MP4_FILENAME_RE.match(filename):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
-    if not _BOTO3_AVAILABLE:
-        return {"deleted": False}
-    try:
-        from config import Config
-        cfg = Config()
-    except Exception:
+    cfg = _get_config_safe()
+    if not cfg or not _BOTO3_AVAILABLE:
         return {"deleted": False}
 
     loop = asyncio.get_event_loop()

@@ -45,6 +45,20 @@ def run_audit(verbose=False):
     valid_names.update({n.stem for n in (VAULT_PATH / "Sources").glob("*.md")})
     valid_names.update({n.stem for n in (VAULT_PATH / "MOCs").glob("*.md")})
     valid_domains = get_taxonomy()
+
+    # A wikilink also resolves via any note's `aliases:` frontmatter — Obsidian's
+    # own resolution rule. Checking filenames alone over-reports broken links for
+    # every note legitimately referenced by an alias rather than its exact title.
+    valid_link_targets = set(valid_names)
+    _alias_re = re.compile(r'^aliases:\s*\[(.*?)\]\s*$', re.MULTILINE)
+    for f in list(notes) + list((VAULT_PATH / "Sources").glob("*.md")) + list((VAULT_PATH / "MOCs").glob("*.md")):
+        try:
+            head = f.read_text()[:2000]
+        except Exception:
+            continue
+        m = _alias_re.search(head)
+        if m:
+            valid_link_targets.update(a.strip() for a in m.group(1).split(",") if a.strip())
     
     broken_links = []
     orphans = set(valid_names)
@@ -58,19 +72,25 @@ def run_audit(verbose=False):
             continue
             
         content = note_file.read_text()
-        
+
+        # Strip fenced and inline code spans before link scanning — code samples
+        # (e.g. `x = torch.tensor([[1.0, 2.0]])`) contain literal "[[...]]" that
+        # isn't a wikilink and would otherwise be misreported as broken.
+        link_scan_content = re.sub(r'```.*?```', '', content, flags=re.DOTALL)
+        link_scan_content = re.sub(r'`[^`\n]*`', '', link_scan_content)
+
         # 1. Check Links & Extract Edges
         # Matches [[Title]] — *rel_type*
-        typed_matches = re.finditer(r'\[\[(.+?)\]\] — \*(\w+)\*', content)
+        typed_matches = re.finditer(r'\[\[(.+?)\]\] — \*(\w+)\*', link_scan_content)
         for m in typed_matches:
             target = m.group(1).split('|')[0].split('#')[0].strip()
             rel_type = m.group(2)
             edges.append((note_file.stem, target, rel_type))
 
-        links = re.findall(r'\[\[(.*?)\]\]', content)
+        links = re.findall(r'\[\[(.*?)\]\]', link_scan_content)
         for link in links:
             target = link.split('|')[0].split('#')[0].strip()
-            if target and target not in valid_names:
+            if target and target not in valid_link_targets:
                 broken_links.append((note_file.name, target))
             if target in orphans:
                 orphans.remove(target)

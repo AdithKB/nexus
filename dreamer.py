@@ -27,6 +27,8 @@ try:
 except ImportError:
     _NUMPY = False
 
+from embed_store import MODEL_ID, EMBED_DIM
+
 
 # ── Result types ──────────────────────────────────────────────
 
@@ -116,7 +118,7 @@ def _dream_sync(config, embed_store) -> DreamReport:
     if report.fleeting_promotions:
         print(f"[DREAMER] {len(report.fleeting_promotions)} fleeting note(s) ready for promotion.", flush=True)
 
-    # 8. Write human-readable report to vault root
+    # 7. Write human-readable report to vault root
     report.duration_sec = time.time() - t0
     _write_dream_report(report, config.vault_path)
 
@@ -147,6 +149,45 @@ def _scan_vault_links(captures_dir: Path) -> dict:
     return links
 
 
+# ── Shared similarity helpers (numpy fast path, manual fallback) ──
+
+
+def _all_pairs_in_band(vecs: list, low: float, high: float) -> list:
+    """All (i, j, sim) pairs with i < j and low <= sim <= high, unsorted."""
+    if _NUMPY:
+        mat = np.array(vecs, dtype=np.float32)  # already L2-normalised
+        sim_matrix = mat @ mat.T
+        rows, cols = np.where((sim_matrix >= low) & (sim_matrix <= high))
+        return [
+            (int(i), int(j), float(sim_matrix[i, j]))
+            for i, j in zip(rows, cols) if i < j
+        ]
+    from embed_store import cosine as _cosine
+    pairs = []
+    for i in range(len(vecs)):
+        for j in range(i + 1, len(vecs)):
+            s = _cosine(vecs[i], vecs[j])
+            if low <= s <= high:
+                pairs.append((i, j, s))
+    return pairs
+
+
+def _best_matches(query_vec: list, candidate_vecs: list, k: int = 1) -> list:
+    """Top-k (index, score) pairs of candidate_vecs against query_vec, sorted descending."""
+    if _NUMPY:
+        mat = np.array(candidate_vecs, dtype=np.float32)
+        q = np.array(query_vec, dtype=np.float32)
+        scores = mat @ q
+        top_idx = np.argsort(scores)[::-1][:k]
+        return [(int(i), float(scores[i])) for i in top_idx]
+    from embed_store import cosine as _cosine
+    scored = sorted(
+        ((i, _cosine(query_vec, v)) for i, v in enumerate(candidate_vecs)),
+        key=lambda x: -x[1],
+    )
+    return scored[:k]
+
+
 # ── Latent link discovery ─────────────────────────────────────
 
 
@@ -167,26 +208,8 @@ def _find_latent_links(notes: list, existing_links: dict) -> list:
 
     titles = [n["title"] for n in notes]
     vecs   = [n["embedding"] for n in notes]
-    candidates = []
 
-    if _NUMPY:
-        mat = np.array(vecs, dtype=np.float32)    # (N, 256), already L2-normalised
-        sim_matrix = mat @ mat.T                   # (N, N) — cosine via dot product
-        rows, cols = np.where(
-            (sim_matrix >= LATENT_LOW) & (sim_matrix <= LATENT_HIGH)
-        )
-        candidates = [
-            (int(i), int(j), float(sim_matrix[i, j]))
-            for i, j in zip(rows, cols) if i < j
-        ]
-    else:
-        from embed_store import cosine as _cosine
-        for i in range(len(notes)):
-            for j in range(i + 1, len(notes)):
-                s = _cosine(vecs[i], vecs[j])
-                if LATENT_LOW <= s <= LATENT_HIGH:
-                    candidates.append((i, j, s))
-
+    candidates = _all_pairs_in_band(vecs, LATENT_LOW, LATENT_HIGH)
     candidates.sort(key=lambda x: -x[2])  # highest similarity first
 
     # Filter already-linked pairs; limit one new link per note per session
@@ -244,22 +267,9 @@ def _rescue_orphan(orphan: dict, all_notes: list, captures_dir: Path) -> bool:
     if not others:
         return False
 
-    if _NUMPY:
-        other_vecs = np.array([n["embedding"] for n in others], dtype=np.float32)
-        q_vec = np.array(orphan_vec, dtype=np.float32)
-        scores = other_vecs @ q_vec
-        top_idx = np.argsort(scores)[::-1][:3]
-        neighbors = [
-            (others[i]["title"], float(scores[i]))
-            for i in top_idx if scores[i] >= 0.50
-        ]
-    else:
-        from embed_store import cosine as _cosine
-        scored = sorted(
-            [(n["title"], _cosine(orphan_vec, n["embedding"])) for n in others],
-            key=lambda x: -x[1],
-        )
-        neighbors = [(t, s) for t, s in scored[:3] if s >= 0.50]
+    other_vecs = [n["embedding"] for n in others]
+    top3 = _best_matches(orphan_vec, other_vecs, k=3)
+    neighbors = [(others[i]["title"], s) for i, s in top3 if s >= 0.50]
 
     written = False
     for target_title, _ in neighbors:
@@ -309,7 +319,7 @@ def _detect_moc_gaps(notes: list, mocs_dir: Path) -> list:
 # ── Fleeting note promotion ───────────────────────────────────
 
 
-def _embed_sync(text: str, dim: int = 256) -> list:
+def _embed_sync(text: str, dim: int = EMBED_DIM) -> list:
     """
     Synchronous Ollama embedding for use within the thread-executor context.
     Embedding is not generation — no text is produced, no LLM synthesis occurs.
@@ -317,7 +327,7 @@ def _embed_sync(text: str, dim: int = 256) -> list:
     import requests as _req
     resp = _req.post(
         "http://localhost:11434/api/embed",
-        json={"model": "qwen3-embedding:4b", "input": [text], "keep_alive": 300},
+        json={"model": MODEL_ID, "input": [text], "keep_alive": 300},
         timeout=30,
     )
     resp.raise_for_status()
@@ -359,20 +369,10 @@ def _promote_fleeting_notes(fleeting_dir: Path, notes: list) -> list:
             continue
 
         best_title, best_sim = "", 0.0
-        if _NUMPY:
-            import numpy as np
-            mat = np.array([n["embedding"] for n in notes], dtype="float32")
-            q   = np.array(vec, dtype="float32")
-            scores = mat @ q
-            idx = int(scores.argmax())
-            best_sim = float(scores[idx])
+        top1 = _best_matches(vec, [n["embedding"] for n in notes], k=1)
+        if top1:
+            idx, best_sim = top1[0]
             best_title = notes[idx]["title"]
-        else:
-            from embed_store import cosine as _cosine
-            for n in notes:
-                s = _cosine(vec, n["embedding"])
-                if s > best_sim:
-                    best_sim, best_title = s, n["title"]
 
         if best_sim >= PROMOTE_THRESHOLD:
             promotions.append(

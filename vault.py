@@ -13,11 +13,12 @@ import hashlib
 import math
 import json
 import subprocess
+import unicodedata
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from config import Config
+from config import Config, ILLEGAL_FILENAME_CHARS
 from extractors import SourceMeta, _compute_source_id
 from processor import ProcessingResult, AtomicNote, KnowledgeGraph
 
@@ -57,9 +58,7 @@ def _git_snapshot(message: str, vault_path: Path):
 # ── Filename Sanitization ─────────────────────────────────────
 
 
-# Characters illegal on macOS, Windows, or Linux filesystems
-# Also strip Obsidian reserved characters: # ^ | [ ]
-_ILLEGAL_CHARS = re.compile(r'[<>:"/\\|?*#\^\[\]\x00-\x1f]')
+_ILLEGAL_CHARS = ILLEGAL_FILENAME_CHARS
 
 
 def slugify(title: str) -> str:
@@ -68,7 +67,6 @@ def slugify(title: str) -> str:
     Preserves Title Case exactly as the LLM produced it (including acronyms like AI, RAG, LLM).
     Only strips OS-illegal and Obsidian-reserved characters.
     """
-    import unicodedata
     # 1. Normalize unicode
     s = title.strip()
     s = unicodedata.normalize("NFKD", s)
@@ -196,8 +194,12 @@ def _format_atomic_note(
     forward_links_yaml = _yaml_list(slugged_links) if slugged_links else "[]"
     moc_yaml = _yaml_list(moc_topics) if moc_topics else "[]"
 
-    # One-sentence summary from first sentence of content (for fast frontmatter RAG reads)
-    first_sentence = (note.content or "").split(".")[0].strip()
+    # One-sentence summary from first sentence of content (for fast frontmatter RAG reads).
+    # Strip a leading numbered-list marker first — method notes start their content
+    # with "1. ..." per SYSTEM_PROMPT rule 6, and a naive split(".")[0] on that would
+    # grab just "1" instead of the actual first step.
+    _summary_source = re.sub(r"^\d+\.\s*", "", (note.content or "").strip())
+    first_sentence = _summary_source.split(".")[0].strip()
     summary_line = f'summary: "{first_sentence}."' if first_sentence else ""
 
     source_quote = getattr(note, "source_quote", "") or ""
@@ -386,6 +388,35 @@ def _get_moc_emoji(topic: str) -> str:
 _MOC_NOTES_HEADER = "## Notes"
 
 
+def _build_moc_content(moc_topic: str, note_titles: list[str], source_title: str) -> str:
+    """
+    Build a brand-new MOC file's content (Dataview block + static ## Notes section).
+    Pure string building, no disk access — shared by _write_moc's "doesn't exist yet"
+    branch and by build_vault_files() (server-side, no local vault to check against).
+    """
+    emoji = _get_moc_emoji(moc_topic)
+    source_slug = slugify(source_title)
+    new_links = [f"- [[{slugify(t)}]]" for t in note_titles]
+    new_links.append(f"- [[{source_slug}]]")
+    now = datetime.now().strftime("%Y-%m-%d")
+    return (
+        "---\n"
+        "type: moc\n"
+        f"aliases: {_yaml_list([moc_topic])}\n"
+        "tags: [moc]\n"
+        f"date: {now}\n"
+        "---\n\n"
+        f"# {emoji}{moc_topic}\n\n"
+        "```dataview\n"
+        "TABLE note_type, date\n"
+        'FROM "Captures"\n'
+        f'WHERE contains(moc, "{moc_topic}")\n'
+        "SORT date DESC\n"
+        "```\n\n"
+        f"{_MOC_NOTES_HEADER}\n"
+    ) + "\n".join(new_links) + "\n"
+
+
 def _write_moc(
     moc_topic: str,
     note_titles: list[str],
@@ -399,7 +430,6 @@ def _write_moc(
     """
     moc_file = moc_dir / f"{slugify(moc_topic)}.md"
     source_slug = slugify(source_title)
-    emoji = _get_moc_emoji(moc_topic)
 
     new_links = [f"- [[{slugify(t)}]]" for t in note_titles]
     new_links.append(f"- [[{source_slug}]]")
@@ -414,24 +444,9 @@ def _write_moc(
                 existing = existing.rstrip("\n") + f"\n{link}\n"
         moc_file.write_text(existing, encoding="utf-8")
     else:
-        now = datetime.now().strftime("%Y-%m-%d")
-        content = (
-            "---\n"
-            "type: moc\n"
-            f"aliases: {_yaml_list([moc_topic])}\n"
-            "tags: [moc]\n"
-            f"date: {now}\n"
-            "---\n\n"
-            f"# {emoji}{moc_topic}\n\n"
-            "```dataview\n"
-            "TABLE note_type, date\n"
-            'FROM "Captures"\n'
-            f'WHERE contains(moc, "{moc_topic}")\n'
-            "SORT date DESC\n"
-            "```\n\n"
-            f"{_MOC_NOTES_HEADER}\n"
-        ) + "\n".join(new_links) + "\n"
-        moc_file.write_text(content, encoding="utf-8")
+        moc_file.write_text(
+            _build_moc_content(moc_topic, note_titles, source_title), encoding="utf-8"
+        )
 
     return moc_file
 
@@ -483,144 +498,17 @@ def _kg_inject_entity_links(content: str, kg: KnowledgeGraph, vault_titles: set[
     return content
 
 
-def _build_kg_note(kg: KnowledgeGraph, source_title: str, note_titles: list[str]) -> str:
+def _model_suffix(model: str, config: Config) -> str:
     """
-    Build a knowledge graph summary note for this capture.
-    Stored in Sources/ alongside the literature note.
-    Shows the entity list and relation triples as a navigable Obsidian table.
+    Filename suffix flagging notes synthesized by the escalation-tier model —
+    empty for the default cheap tier, so the common case keeps clean filenames
+    and cascade-escalated notes (§4a routing) are visibly marked instead.
     """
-    now = datetime.now().strftime("%Y-%m-%d")
-    source_slug = slugify(source_title)
-    lines = [
-        "---",
-        "type: kg",
-        "tags: [knowledge-graph, auto-generated]",
-        f"date: {now}",
-        "---",
-        "",
-        f"# Knowledge Graph — {source_title}",
-        "",
-        f"*Extracted from [[Source - {source_slug}]]*",
-        "",
-        "## Entities",
-    ]
-    for entity in sorted(kg.entities):
-        slug = slugify(entity)
-        lines.append(f"- [[{slug}]] *(entity)*")
-
-    lines += ["", "## Relations", ""]
-    if kg.relations:
-        lines.append("| Subject | Relation | Object |")
-        lines.append("|---------|----------|--------|")
-        for rel in kg.relations:
-            if len(rel) == 3:
-                subj, verb, obj = rel
-                lines.append(
-                    f"| [[{slugify(subj)}]] | {verb} | [[{slugify(obj)}]] |"
-                )
-    else:
-        lines.append("*(no relations extracted)*")
-
-    lines += ["", "## Notes from this capture"]
-    for t in note_titles:
-        lines.append(f"- [[{slugify(t)}]]")
-    lines.append("")
-
-    return "\n".join(lines)
-
-
-_DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
-
-
-def _model_suffix(config: Config) -> str:
-    """Return a filename suffix like '-flash' when a non-default model is used, else ''."""
-    if config.llm_provider != "gemini" or config.gemini_model == _DEFAULT_GEMINI_MODEL:
+    if config.llm_provider != "gemini" or not model or model == config.gemini_synthesis_model:
         return ""
-    # e.g. gemini-2.5-flash → -flash, gemini-2.5-pro → -pro
-    short = config.gemini_model.split("-")[-1]  # last segment
+    # e.g. gemini-3.1-pro-preview → -preview
+    short = model.split("-")[-1]
     return f"-{short}"
-
-
-def build_vault_files(
-    result: ProcessingResult,
-    meta: SourceMeta,
-    config: Config,
-    vault_index: list[dict] | None = None,
-) -> dict:
-    """
-    Generate vault file contents in memory without writing to disk.
-
-    Returns:
-        {
-          "captures": [{"filename": str, "content": str}, ...],
-          "sources":  [{"filename": str, "content": str}],
-          "mocs":     [{"filename": str, "content": str}, ...],
-        }
-
-    Used by the cloud server (/capture?return_files=true) so the iOS Shortcut
-    can save files directly into the iCloud Obsidian vault on the phone.
-    """
-    note_titles = [n.title for n in result.atomic_notes]
-    kg = result.knowledge_graph
-
-    # Build a set of known vault titles (slugified) for vault_links validation
-    # and KG entity link injection. Includes both vault index AND this batch.
-    vault_titles: set[str] | None = None
-    if vault_index:
-        vault_titles = {slugify(n["title"]) for n in vault_index if n.get("title")}
-    else:
-        vault_titles = set()
-    # Add batch titles so KG can link within-batch too
-    vault_titles.update(slugify(t) for t in note_titles)
-
-    # Derive content title — same logic as write_to_vault so source backlinks stay consistent
-    _raw_src = (getattr(result, "source_note_title", "") or "").removeprefix("Source - ").strip()
-    _src_display_title = _raw_src or meta.title
-
-    captures = []
-    for note in result.atomic_notes:
-        # Inject KG entity links into note content before formatting
-        enriched_note = note.model_copy()
-        if kg and kg.entities and vault_titles:
-            enriched_note.content = _kg_inject_entity_links(
-                note.content, kg, vault_titles
-            )
-
-        content = _format_atomic_note(
-            enriched_note,
-            source_url=meta.url,
-            source_title=_src_display_title,
-            source_id=meta.source_id,
-            default_tags=config.default_tags,
-            batch_titles=note_titles,
-            vault_titles=vault_titles,
-            llm_model=config.gemini_model if config.llm_provider == "gemini" else "",
-            moc_topics=result.suggested_mocs,
-        )
-        suffix = _model_suffix(config)
-        captures.append({"filename": f"{slugify(note.title)}{suffix}.md", "content": content})
-
-    suffix = _model_suffix(config)
-    _raw_src_title = getattr(result, "source_note_title", "") or ""
-    _display_src_title = _raw_src_title.removeprefix("Source - ").strip() or meta.title
-    sources = [{
-        "filename": f"{slugify(_display_src_title)}{suffix}.md",
-        "content": _format_source_note(
-            meta, result.source_summary, note_titles, config.default_tags,
-            kg=kg, key_takeaways=getattr(result, "key_takeaways", None),
-            display_title=_display_src_title,
-        ),
-    }]
-
-    mocs = [
-        {
-            "filename": f"{slugify(moc_topic)}{suffix}.md",
-            "content": _build_moc_content(moc_topic, note_titles, meta.title),
-        }
-        for moc_topic in result.suggested_mocs
-    ]
-
-    return {"captures": captures, "sources": sources, "mocs": mocs}
 
 
 def validate_note(note: AtomicNote) -> list[str]:
@@ -701,49 +589,6 @@ def _write_reciprocal_link(target_title: str, source_title: str, rel: str, captu
         print(f"[RECIPROCAL] Failed to write back-link to {target_title}: {e}", flush=True)
 
 
-def write_seedling(seedling: "RelaySeedling", meta: SourceMeta, config: Config) -> Path:
-    """
-    Stage 1: The 'Relay' (Cloud-Side)
-    Output: Captures/Seedling_[TIMESTAMP]_[SOURCE_ID].md
-    Properties: status: seedling, synced: false.
-    """
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    filename = f"Seedling_{timestamp}_{seedling.source_id}.md"
-    captures_dir = config.get_notes_dir()
-    filepath = captures_dir / filename
-    
-    tags = ["nexus/seedling"] + [f"entity/{slugify(e)}" for e in seedling.entities]
-    
-    content = f"""---
-type: seedling
-status: seedling
-synced: false
-source_id: {seedling.source_id}
-source_url: {meta.url}
-title: "{seedling.title}"
-entities: {_yaml_list(seedling.entities)}
-tags: {_yaml_list(tags)}
-date: {datetime.now().strftime("%Y-%m-%d")}
----
-
-# {seedling.title}
-
-> [!NEXUS-RELAY]
-> This is a Stage 1 Relay seedling. The Mac-side Crystallizer will process this file to extract full atomic notes and logical links.
-
-## Metadata
-- **Source**: {meta.url}
-- **ID**: {seedling.source_id}
-- **Relay Entities**: {", ".join(seedling.entities)}
-
-## Raw Context
-{meta.transcript[:5000]}
-"""
-    filepath.write_text(content, encoding="utf-8")
-    print(f"[RELAY] Seedling created: {filename}", flush=True)
-    return filepath
-
-
 def write_to_vault(
     result: ProcessingResult,
     meta: SourceMeta,
@@ -776,6 +621,7 @@ def write_to_vault(
     _git_snapshot(f"Auto-capture start: {meta.title}", config.vault_path)
 
     # ── Write atomic notes ────────────────────────────────────
+    suffix = _model_suffix(result.model_used, config)
     for note in result.atomic_notes:
         # Per-note Tier 1 Audit
         warnings = validate_note(note)
@@ -795,10 +641,9 @@ def write_to_vault(
             default_tags=config.default_tags,
             batch_titles=note_titles,
             vault_titles=vault_titles,
-            llm_model=config.gemini_model if config.llm_provider == "gemini" else "",
+            llm_model=result.model_used if config.llm_provider == "gemini" else "",
             moc_topics=result.suggested_mocs,
         )
-        suffix = _model_suffix(config)
         filepath = captures_dir / f"{slugify(note.title)}{suffix}.md"
         filepath.write_text(content, encoding="utf-8")
         created.append(filepath)
@@ -815,7 +660,6 @@ def write_to_vault(
         kg=kg, key_takeaways=getattr(result, "key_takeaways", None),
         display_title=display_title,
     )
-    suffix = _model_suffix(config)
     source_file = sources_dir / f"{slugify(display_title)}{suffix}.md"
     source_file.write_text(source_content, encoding="utf-8")
     created.append(source_file)
@@ -847,6 +691,84 @@ def write_to_vault(
     _ensure_query_guides(config.vault_path)
 
     return created
+
+
+def build_vault_files(
+    result: ProcessingResult,
+    meta: SourceMeta,
+    config: Config,
+    vault_index: list[dict] | None = None,
+) -> dict:
+    """
+    Generate vault file contents in memory, without touching local disk.
+
+    Used by the cloud server for full-Gemini captures (config.llm_provider ==
+    "gemini") that complete entirely on the droplet — there's no local vault to
+    write to, so the resulting files are uploaded to Spaces (_upload_to_spaces)
+    for vault_writer.py to pull down and write to the actual vault later.
+
+    Reuses the exact same formatters as write_to_vault() so cloud-completed and
+    locally-completed captures produce byte-identical note formatting. The one
+    structural difference: MOC content here can only ever be the "brand new
+    file" template (_build_moc_content) — this function has no way to know
+    whether a MOC by this name already exists in the Mac's vault, so merging
+    with an existing MOC is handled on the pull side (vault_writer.py), not here.
+
+    Returns:
+        {
+          "captures": [{"filename": str, "content": str}, ...],
+          "sources":  [{"filename": str, "content": str}],
+          "mocs":     [{"filename": str, "content": str}, ...],
+        }
+    """
+    note_titles = [n.title for n in result.atomic_notes]
+    kg = result.knowledge_graph
+
+    _raw_source_title = (getattr(result, "source_note_title", "") or "").removeprefix("Source - ").strip()
+    display_title = _raw_source_title or meta.title
+
+    vault_titles: set[str] = set()
+    if vault_index:
+        vault_titles = {slugify(n["title"]) for n in vault_index if n.get("title")}
+    vault_titles.update(slugify(t) for t in note_titles)
+
+    suffix = _model_suffix(result.model_used, config)
+    captures = []
+    for note in result.atomic_notes:
+        enriched_note = note.model_copy()
+        if kg and kg.entities:
+            enriched_note.content = _kg_inject_entity_links(note.content, kg, vault_titles)
+        content = _format_atomic_note(
+            enriched_note,
+            source_url=meta.url,
+            source_title=display_title,
+            source_id=meta.source_id,
+            default_tags=config.default_tags,
+            batch_titles=note_titles,
+            vault_titles=vault_titles,
+            llm_model=result.model_used if config.llm_provider == "gemini" else "",
+            moc_topics=result.suggested_mocs,
+        )
+        captures.append({"filename": f"{slugify(note.title)}{suffix}.md", "content": content})
+
+    sources = [{
+        "filename": f"{slugify(display_title)}{suffix}.md",
+        "content": _format_source_note(
+            meta, result.source_summary, note_titles, config.default_tags,
+            kg=kg, key_takeaways=getattr(result, "key_takeaways", None),
+            display_title=display_title,
+        ),
+    }]
+
+    mocs = [
+        {
+            "filename": f"{slugify(moc_topic)}.md",
+            "content": _build_moc_content(moc_topic, note_titles, meta.title),
+        }
+        for moc_topic in result.suggested_mocs
+    ]
+
+    return {"captures": captures, "sources": sources, "mocs": mocs}
 
 
 def compute_link_entropy(captures_dir: Path) -> tuple[float, dict, int, int]:

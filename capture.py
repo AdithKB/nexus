@@ -26,6 +26,7 @@ Env vars:
 """
 import argparse
 import asyncio
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -33,7 +34,7 @@ from pathlib import Path
 
 from config import Config
 from embed_store import EmbedStore
-from extractors import extract_source
+from extractors import extract_source, _PODCAST_DOMAINS, _TWITTER_DOMAINS
 from processor import process_source
 from vault import write_to_vault, check_duplicate
 
@@ -56,11 +57,16 @@ def header(msg: str):
 
 
 def _detect_source_type(url: str) -> str:
+    """Cosmetic pre-extraction label for CLI output — mirrors extractors.extract_source's routing."""
     lower = url.lower().strip()
     if any(x in lower for x in ["youtube.com", "youtu.be", "yt.be"]):
         return "youtube"
     elif "instagram.com" in lower:
         return "instagram"
+    elif any(d in lower for d in _TWITTER_DOMAINS):
+        return "twitter"
+    elif any(d in lower for d in _PODCAST_DOMAINS):
+        return "podcast"
     elif lower.endswith(".pdf") or lower.startswith("file://"):
         return "pdf"
     return "web"
@@ -98,8 +104,6 @@ async def run_pipeline(
     t0 = time.time()
     source_type = _detect_source_type(url)
 
-    # ... (rest of function logic unchanged until Step 2) ...
-
     # ── Step 0: Dedup check ───────────────────────────────────
     header(f"PIPELINE · {source_type.upper()} → STRUCTURE → VAULT")
     info(f"URL: {url}")
@@ -133,12 +137,7 @@ async def run_pipeline(
 
     # ── Step 2: Structure with LLM ────────────────────────────
     header("STEP 2 · Chain-of-Density extraction")
-    model_name = {
-        "gemini": config.gemini_model,
-        "groq": config.groq_model,
-        "openai": config.openai_model,
-        "ollama": config.ollama_model,
-    }.get(config.llm_provider, "unknown")
+    model_name = getattr(config, f"{config.llm_provider}_model", "unknown")
     info(f"Provider: {config.llm_provider} ({model_name})")
     info(f"Target: {config.min_notes}-{config.max_notes} atomic notes, {config.alias_count} aliases each")
 

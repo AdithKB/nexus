@@ -190,6 +190,7 @@ class ProcessingResult:
     knowledge_graph: Optional[KnowledgeGraph] = None
     token_usage: dict = field(default_factory=dict)
     anchors_recovered: int = 0  # anchors the integrity gate had to append (0 = perfect synthesis)
+    model_used: str = ""  # actual Gemini model that synthesized this note (cascade routing may escalate)
 
 
 # ── SOTA System Prompt ────────────────────────────────────────
@@ -659,6 +660,23 @@ You are a precise multimodal data sensor. Your output is an exhaustive factual r
 # ── Stage 2: Local Crystallizer ───────────────────────────────
 
 
+def _select_gemini_synthesis_model(meta: SourceMeta, anchor_count: int, config: Config) -> str:
+    """
+    Cascade routing for the full-cloud path: default to the cheap tier,
+    escalate to the quality tier only for content that demonstrably needs it —
+    PDFs, long-form video, or technically dense sources. 2026 LLM-routing best
+    practice: route the obvious majority cheap, escalate only what needs it,
+    rather than pre-classifying everything through a trained router.
+    """
+    if meta.source_type == "pdf":
+        return config.gemini_synthesis_model_quality
+    if meta.source_type in ("youtube", "instagram") and meta.duration_sec >= 3600:
+        return config.gemini_synthesis_model_quality
+    if anchor_count >= 5:
+        return config.gemini_synthesis_model_quality
+    return config.gemini_synthesis_model
+
+
 async def run_crystallizer_stage(
     description: str,
     meta: SourceMeta,
@@ -672,7 +690,6 @@ async def run_crystallizer_stage(
     print(f"[CRYSTALLIZER] Stage 2: Synthesis ({config.llm_provider.upper()})...", flush=True)
     
     # 1. Retrieval — RAG context from vault (disabled: LanceDB Rust code causes SIGSEGV in asyncio context)
-    keep_alive = getattr(config, "ollama_keep_alive", 300)
     active_vault_index = []
 
     # 2. Extract Mandatory Anchors
@@ -693,9 +710,28 @@ async def run_crystallizer_stage(
     user_prompt = _build_user_prompt(meta, config, vault_index=active_vault_index, user_intent=user_intent, anchor_count=len(anchors))
     grounded_prompt = f"{description}\n{anchor_prompt}\n{user_prompt}"
 
-    raw_response, usage = await _ollama_generate(grounded_prompt, SYSTEM_PROMPT, config)
-
-    repair_fn = _mlx_generate if config.llm_provider == "mlx" else _ollama_generate
+    if config.llm_provider == "gemini":
+        # Full-cloud capture path — synthesis via Gemini instead of local Ollama/MLX.
+        # Cascade: cheap tier by default, escalated to the quality tier either by
+        # _select_gemini_synthesis_model() up front (PDF/long video/dense anchors)
+        # or by the repair path below, which always escalates on a parse failure —
+        # a cheap tier miss is itself a signal the content was harder than expected.
+        chosen_model = _select_gemini_synthesis_model(meta, len(anchors), config)
+        raw_response, usage = await _gemini_generate(
+            grounded_prompt, SYSTEM_PROMPT,
+            api_key=config.gemini_api_key,
+            model=chosen_model,
+            temperature=config.temperature,
+        )
+        repair_fn = lambda p, s, c: _gemini_generate(
+            p, s, api_key=c.gemini_api_key, model=c.gemini_synthesis_model_quality, temperature=c.temperature
+        )
+    elif config.llm_provider == "mlx":
+        raw_response, usage = await _mlx_generate(grounded_prompt, SYSTEM_PROMPT, config)
+        repair_fn = _mlx_generate
+    else:
+        raw_response, usage = await _ollama_generate(grounded_prompt, SYSTEM_PROMPT, config)
+        repair_fn = _ollama_generate
 
     # 4. Parse & Repair
     collection = await _parse_and_repair(raw_response, grounded_prompt, SYSTEM_PROMPT, config, repair_fn)
@@ -734,56 +770,11 @@ async def run_crystallizer_stage(
         knowledge_graph=collection.knowledge_graph,
         token_usage=usage,
         anchors_recovered=anchors_recovered,
+        # Reflects the primary cascade attempt; a repair-path escalation (rare —
+        # only on parse failure) isn't distinguished here, since _parse_and_repair
+        # doesn't report which attempt ultimately succeeded.
+        model_used=chosen_model if config.llm_provider == "gemini" else "",
     )
-
-
-async def _apply_integrity_gate(collection: NoteCollection, anchors: list[dict], config: Config) -> Tuple[NoteCollection, int]:
-    """
-    Guarantees that mandatory anchors survive into the vault.
-    If an anchor is missing semantically, it is appended to the most relevant note.
-    Returns (collection, anchors_recovered) so callers can track synthesis quality.
-    """
-    if not anchors: return collection, 0
-
-    from sentence_transformers import SentenceTransformer, util
-    model = SentenceTransformer(config.semantic_model)
-    
-    # Flatten all content for search
-    all_content = " ".join([n.content + " " + " ".join(n.aliases) for n in collection.notes])
-    all_content_emb = model.encode(all_content)
-    
-    missing_anchors = []
-    for anchor in anchors:
-        term = anchor['term']
-        # 1. Fuzzy check (string contains)
-        if term.lower() in all_content.lower():
-            continue
-            
-        # 2. Semantic check (fallback)
-        term_emb = model.encode(term)
-        score = util.cos_sim(term_emb, all_content_emb).item()
-        
-        if score < config.semantic_threshold:
-            missing_anchors.append(anchor)
-
-    if missing_anchors and collection.notes:
-        print(f"[INTEGRITY] Found {len(missing_anchors)} missing anchors. Routing to most relevant notes...", flush=True)
-        # Pre-encode all notes (title + content) for similarity routing
-        note_texts = [n.title + " " + n.content for n in collection.notes]
-        note_embs = model.encode(note_texts)
-
-        for ma in missing_anchors:
-            term_emb = model.encode(ma['term'])
-            scores = [util.cos_sim(term_emb, ne).item() for ne in note_embs]
-            best_idx = max(range(len(scores)), key=lambda i: scores[i])
-            note = collection.notes[best_idx]
-            if "## Source Anchors (Unsynthesized)" not in note.content:
-                note.content += "\n\n## Source Anchors (Unsynthesized)\n"
-            note.content += f"- **{ma['term']}**: {ma['quote']}\n"
-            note.needs_review = True
-            print(f"[INTEGRITY]   '{ma['term']}' → note '{note.title}' (score={scores[best_idx]:.3f})", flush=True)
-
-    return collection, len(missing_anchors)
 
 
 # ── Clients ───────────────────────────────────────────────────
@@ -1179,11 +1170,6 @@ async def _delete_gemini_file(file_uri: str, api_key: str):
     await loop.run_in_executor(None, lambda: client.files.delete(name=file_name))
 
 
-async def process_source_entry(meta: SourceMeta, config: Config, vault_index: list = None, user_intent: str = "") -> ProcessingResult:
-    # Minimal wrapper for top-level entry
-    return await process_source(meta, config, vault_index, user_intent)
-
-
 async def process_source(
     meta: SourceMeta,
     config: Config,
@@ -1196,10 +1182,6 @@ async def process_source(
     """
     # 1. Stage 1: Cloud Relay (Extraction + Cache Padding)
     relay_description = await run_relay_stage(meta, config)
-    
-    # If we are in 'relay' mode (server), we stop here and return a partial result.
-    if config.llm_provider == "hybrid" and not embed_store:
-        return ProcessingResult(source_summary=relay_description)
 
     # 2. Stage 2: Local Crystallizer (Synthesis + Semantic Gate)
     if not embed_store:

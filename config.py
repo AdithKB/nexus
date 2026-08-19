@@ -5,11 +5,18 @@ Author: Adith K B
 Set env vars or edit defaults below.
 """
 import os
+import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# OS-illegal / Obsidian-reserved filename characters. Shared by vault.slugify()
+# and embed_store._slugify_title() — kept here since both files eventually
+# import config.py, so this has zero circular-import risk (unlike the two
+# slugify *functions* themselves, which must stay duplicated).
+ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*#\^\[\]\x00-\x1f]')
 
 
 @dataclass
@@ -41,7 +48,14 @@ class Config:
     # Tier 1 Paid API — Flash-Lite with 90% Context Caching.
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
-    gemini_cache_threshold: int = 4096  # tokens; min to trigger 90% discount
+    # Stage 2 synthesis, used only when llm_provider == "gemini" (full-cloud capture
+    # path — bypasses local Ollama/MLX entirely). Deliberately a stronger tier than
+    # gemini_model above: this replaces 14B-Qwen-quality note synthesis, not extraction.
+    gemini_synthesis_model: str = os.getenv("GEMINI_SYNTHESIS_MODEL", "gemini-3.7-flash")
+    # Escalation tier: used only for content that demonstrably benefits (PDFs,
+    # long-form video, technically dense sources) or when the cheap tier's
+    # output fails to parse — see _select_gemini_synthesis_model() in processor.py.
+    gemini_synthesis_model_quality: str = os.getenv("GEMINI_SYNTHESIS_MODEL_QUALITY", "gemini-3.1-pro-preview")
 
     # ── Groq (explicit text-only fallback) ────────────────────
     groq_api_key: str = os.getenv("GROQ_API_KEY", "")
@@ -72,11 +86,6 @@ class Config:
     # Required Ollama server env vars (set before `ollama serve` on Mac):
     #   OLLAMA_MAX_LOADED_MODELS=2   — hold both embedding + synthesis models simultaneously
     #   OLLAMA_NUM_PARALLEL=1        — prevent concurrent requests from spiking RAM on 16 GB
-
-    # ── Validation Gate (Sovereign Integrity) ──────────────────
-    # Semantic similarity threshold for anchor verification
-    semantic_threshold: float = 0.85  # 0.0 to 1.0 (cosine similarity)
-    semantic_model: str = "all-MiniLM-L6-v2"
 
     # ── Note Generation (2026 SOTA Limits) ────────────────────
     max_notes: int = 10
@@ -140,22 +149,19 @@ class Config:
     compress_threshold_chars: int = 16_000   # chars; ~4k tokens
     compress_target_ratio: float = 0.25      # keep top 25% of sentences
 
-    def get_notes_dir(self) -> Path:
-        d = self.vault_path / self.notes_folder
+    def _dir(self, folder: str) -> Path:
+        d = self.vault_path / folder
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def get_notes_dir(self) -> Path:
+        return self._dir(self.notes_folder)
 
     def get_source_dir(self) -> Path:
-        d = self.vault_path / self.source_folder
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        return self._dir(self.source_folder)
 
     def get_moc_dir(self) -> Path:
-        d = self.vault_path / self.moc_folder
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        return self._dir(self.moc_folder)
 
     def get_fleeting_dir(self) -> Path:
-        d = self.vault_path / self.fleeting_folder
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        return self._dir(self.fleeting_folder)

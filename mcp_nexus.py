@@ -149,6 +149,30 @@ async def _extract_async(url: str, config: Config) -> SourceMeta:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, extract_source, url, config)
 
+
+async def _synthesize_and_write(meta: SourceMeta, config: Config, vault_index: list,
+                                 user_intent: str, store) -> tuple:
+    """
+    Shared by research_to_vault (single URL) and research_topic (per-source, in a loop):
+    Stage 2 synthesis → write to vault → embed-index the new notes.
+    Returns (result, notes_to_index) so callers can layer their own summary/compounding logic on top.
+    """
+    result = await process_source(meta, config, vault_index=vault_index, user_intent=user_intent, embed_store=store)
+    write_to_vault(result, meta, config, vault_index=vault_index)
+
+    notes_to_index = [
+        {
+            "title": note.title,
+            "aliases": note.aliases or [],
+            "tags": note.tags or [],
+            "note_type": note.note_type,
+            "content": note.content,
+        }
+        for note in result.atomic_notes
+    ]
+    await store.upsert_notes(notes_to_index)
+    return result, notes_to_index
+
 # ── Resources ────────────────────────────────────────────────
 
 @app.list_resources()
@@ -481,24 +505,9 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
             # Fetch vault index before synthesis so forward_links resolve correctly
             vault_index = store.get_all_as_index()
 
-            # Step 2: Process (Stage 1 + Stage 2)
-            result = await process_source(meta, config, vault_index=vault_index, user_intent=user_intent, embed_store=store)
+            # Steps 2-4: Synthesize, write to vault, embed-index
+            result, notes_to_index = await _synthesize_and_write(meta, config, vault_index, user_intent, store)
 
-            # Step 3: Write to Vault
-            created_files = write_to_vault(result, meta, config, vault_index=vault_index)
-            
-            # Step 4: Index immediately
-            notes_to_index = []
-            for note in result.atomic_notes:
-                notes_to_index.append({
-                    "title": note.title,
-                    "aliases": note.aliases or [],
-                    "tags": note.tags or [],
-                    "note_type": note.note_type,
-                    "content": note.content
-                })
-            await store.upsert_notes(notes_to_index)
-            
             # Step 5: Log
             _log_action("MCP research_to_vault", f"url={url} | notes_created={len(result.atomic_notes)}")
             
@@ -593,36 +602,21 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
                     
                 try:
                     # Stage 2: Synthesis (Sequential for Thermal Safety + Compounding)
-                    result = await process_source(meta, config, vault_index=vault_index, user_intent=topic_intent, embed_store=store)
+                    result, notes_to_index = await _synthesize_and_write(
+                        meta, config, vault_index, topic_intent, store
+                    )
 
-                    # Write to vault
-                    write_to_vault(result, meta, config, vault_index=vault_index)
-
-                    # Index new notes immediately and update incremental index
-                    notes_to_index = []
-                    for note in result.atomic_notes:
-                        note_entry = {
-                            "title": note.title,
-                            "aliases": note.aliases or [],
-                            "tags": note.tags or [],
-                            "note_type": note.note_type,
-                            "content": note.content
-                        }
-                        notes_to_index.append(note_entry)
-                        
+                    for note, note_entry in zip(result.atomic_notes, notes_to_index):
                         # Optimization 2: Merge incrementally into running index
                         vault_index.append({
-                            "title": note.title,
-                            "aliases": note.aliases or [],
-                            "tags": note.tags or [],
-                            "note_type": note.note_type
+                            "title": note_entry["title"],
+                            "aliases": note_entry["aliases"],
+                            "tags": note_entry["tags"],
+                            "note_type": note_entry["note_type"],
                         })
-                        
                         # Capture data for synthesis
                         first_sentence = note.content.split(".")[0].strip() if "." in note.content else note.content.strip()
                         synthesis_note_data.append((note.title, first_sentence))
-                        
-                    await store.upsert_notes(notes_to_index)
 
                     completed.append(url)
                     all_created_notes[url] = [n.title for n in result.atomic_notes]

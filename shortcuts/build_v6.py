@@ -1,30 +1,20 @@
 #!/usr/bin/env python3
 """
-Nexus v6.0 — Unified Smart Capture Shortcut
+Nexus v6.6 — Share Sheet Capture Shortcut
 
-Single shortcut, three surfaces:
+Single surface: share sheet (Safari, YouTube, Instagram…). Shortcut Input has
+a URL → an explicit "Capture Mode" menu asks Standard vs Cloud, then POSTs
+to /capture:
 
-  1. Share sheet (Safari, YouTube, Instagram…)
-        Shortcut Input has URL → POST /capture  (full synthesis pipeline)
+  • 📝 Standard Capture → local pipeline (Stage 2 synthesis via Ollama/MLX
+        on the Mac, once watcher.py picks up the seedling)
+  • ☁️ Cloud Capture    → "provider": "gemini" added to the POST body —
+        both stages run via Gemini on the droplet, no Mac required; finished
+        notes are pushed straight to DigitalOcean Spaces for vault_writer.py
+        (or the phone's Remotely Save plugin) to pull.
 
-  2. Direct tap (home screen icon)
-        Text input appears → smart routing via POST /capture_smart:
-          • Starts with "RQ " → research query pipeline
-          • Looks like a URL  → synthesis pipeline
-          • Anything else     → fleeting note (Vault/Fleeting/)
-
-  3. 🎙️ Record Audio (menu option; configure Action Button / Back Tap to reach here fast)
-        Record → base64 → POST /capture_voice_fleeting
-        Server transcribes via Groq; "RQ …" spoken prefix also triggers research pipeline
-
-Routing notes
-─────────────
-  • The "RQ " prefix trick works for BOTH tap (typed) and hold (spoken), because
-    /capture_smart and /capture_voice_fleeting both run _detect_intent() server-side.
-  • Siri dictation (microphone button on keyboard) is available in the Ask prompt,
-    so you can speak fleeting notes / research queries without recording a separate file.
-  • iOS Action Button: configure it to run this shortcut.  The instant menu appears
-    in < 0.3 s; tap 🎙️ to start recording.  1 extra tap is the unavoidable iOS constraint.
+Note: /capture_smart and /capture_voice_fleeting are live, working server
+routes with no client surface currently wired to them in this shortcut.
 """
 import plistlib
 import subprocess
@@ -32,7 +22,7 @@ import uuid
 from pathlib import Path
 
 RELAY_URL = "https://nexus.adithkb.dev"
-VERSION = "6.5"
+VERSION = "6.6"
 NAME = f"Nexus v{VERSION}"
 SCRIPT_DIR = Path(__file__).parent
 
@@ -282,8 +272,14 @@ def end_menu(group_id):
 def build():
     actions = []
 
-    # Pure share-sheet capture — no conditional, no branching.
-    # POST the URL straight to /capture and notify.
+    # Share sheet capture with an explicit capture-mode choice. Standard is
+    # the fast default (local Ollama/MLX Stage 2); Cloud Capture opts into
+    # Gemini for both stages so the note finishes without the Mac — deliberate
+    # per-capture choice, not silent/automatic.
+    group_id = uid()
+    actions.append(begin_menu(group_id, "Capture Mode", ["📝 Standard Capture", "☁️ Cloud Capture"]))
+
+    actions.append(menu_case(group_id, "📝 Standard Capture"))
     actions.append(
         action_post_json(
             "/capture",
@@ -294,6 +290,21 @@ def build():
         )
     )
     actions.append(action_notify("Nexus 🌱", "URL queued for crystallization"))
+
+    actions.append(menu_case(group_id, "☁️ Cloud Capture"))
+    actions.append(
+        action_post_json(
+            "/capture",
+            [
+                dict_item("url", input_url_token()),
+                dict_item("return_files", text_token("true")),
+                dict_item("provider", text_token("gemini")),
+            ],
+        )
+    )
+    actions.append(action_notify("Nexus ☁️", "Cloud capture — synthesizing via Gemini"))
+
+    actions.append(end_menu(group_id))
 
     return {
         "WFWorkflowClientVersion": "3300.0.4",
@@ -329,9 +340,7 @@ if __name__ == "__main__":
         print()
         print("   Surfaces")
         print("   ──────────────────────────────────────────────────────")
-        print("   Share sheet  →  automatic URL capture (tap Share → Nexus)")
-        print("   Home screen  →  instant 2-option menu (📝 or 🎙️)")
-        print("   Action Button→  configure to run this shortcut, then tap 🎙️")
+        print("   Share sheet  →  tap Share → Nexus → choose Standard or Cloud Capture")
     else:
         print(f"Sign failed: {result.stderr}")
         print(f"  Unsigned: {unsigned}")

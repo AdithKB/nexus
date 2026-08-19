@@ -24,8 +24,10 @@ from pathlib import Path
 
 import httpx
 
+from config import Config
+
 SERVER = "https://nexus.adithkb.dev"
-VAULT = Path("/Users/adithkb/Library/Mobile Documents/iCloud~md~obsidian/Documents/Nexus")
+VAULT = Config().vault_path
 FOLDERS = {
     "captures": VAULT / "Captures",
     "mocs":     VAULT / "MOCs",
@@ -103,16 +105,11 @@ def _parse_frontmatter(text: str) -> dict:
             continue
         if not in_fm:
             continue
-        if line.startswith("aliases:"):
-            raw = line.split("aliases:", 1)[1].strip()
+        matched_field = next((f for f in ("aliases", "tags") if line.startswith(f"{f}:")), None)
+        if matched_field:
+            raw = line.split(f"{matched_field}:", 1)[1].strip()
             items = re.findall(r'"([^"]+)"|\'([^\']+)\'|([^,\[\]]+)', raw)
-            result["aliases"] = [
-                (a or b or c).strip() for a, b, c in items if (a or b or c).strip()
-            ]
-        elif line.startswith("tags:"):
-            raw = line.split("tags:", 1)[1].strip()
-            items = re.findall(r'"([^"]+)"|\'([^\']+)\'|([^,\[\]]+)', raw)
-            result["tags"] = [
+            result[matched_field] = [
                 (a or b or c).strip() for a, b, c in items if (a or b or c).strip()
             ]
         elif line.startswith("note_type:"):
@@ -173,7 +170,6 @@ def push_vault_index(client: httpx.Client) -> int:
     # ── Update Local EmbedStore ────────────────────────────────
     try:
         from embed_store import EmbedStore
-        from config import Config
         cfg = Config()
         store = EmbedStore(api_key=cfg.gemini_api_key)
         
@@ -202,6 +198,25 @@ def push_vault_index(client: httpx.Client) -> int:
 
 
 # ── Pending notes ─────────────────────────────────────────────
+
+_MOC_NOTES_HEADER = "## Notes"
+_MOC_LINK_RE = re.compile(r"^- \[\[.+\]\]\s*$", re.MULTILINE)
+
+
+def _merge_moc_content(existing: str, incoming: str) -> str:
+    """
+    Merge a server-built MOC's links into an already-existing local MOC file
+    instead of overwriting it. The server (vault.build_vault_files) can only
+    ever build "MOC doesn't exist yet" content since it has no local vault
+    access — mirrors _write_moc()'s own existing-file branch in vault.py.
+    """
+    if _MOC_NOTES_HEADER not in existing:
+        existing = existing.rstrip("\n") + f"\n\n{_MOC_NOTES_HEADER}\n"
+    for link in _MOC_LINK_RE.findall(incoming):
+        link = link.strip()
+        if link not in existing:
+            existing = existing.rstrip("\n") + f"\n{link}\n"
+    return existing
 
 
 def pull_pending_files(client: httpx.Client) -> int:
@@ -233,6 +248,9 @@ def pull_pending_files(client: httpx.Client) -> int:
             dest = VAULT / rel_path
 
         dest.parent.mkdir(parents=True, exist_ok=True)
+        if rel_path.startswith("MOCs/") and dest.exists():
+            existing = dest.read_text(encoding="utf-8")
+            content = _merge_moc_content(existing, content)
         dest.write_text(content, encoding="utf-8")
         print(f"[pull] Wrote {rel_path}", flush=True)
         

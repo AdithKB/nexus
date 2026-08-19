@@ -119,6 +119,43 @@ everything else (web, text, short video)          →  9B fast path (MLX in-proc
 source_type == "fleeting"                         →  skipped entirely (no LLM)
 ```
 
+### 4a. Full-Cloud Capture Path (`llm_provider == "gemini"`)
+
+Opt-in per-capture escape hatch for when the Mac is off, asleep, or unreachable — both stages run on the droplet via Gemini, so the note finishes without the Mac at all. Triggered by the iOS Shortcut's "☁️ Cloud Capture" menu choice, which adds `"provider": "gemini"` to the `/capture` POST body; `build_config(provider=req.provider, ...)` threads it into `Config.llm_provider`.
+
+| Property | Value |
+|---|---|
+| **Stage 1 model** | `gemini_model` — same `gemini-3.1-flash-lite-preview` extraction tier as the default path |
+| **Stage 2 model** | Cascade-routed by `_select_gemini_synthesis_model()` — see below |
+| **Where it runs** | `server.py`'s `_process_job()` — after `run_relay_stage()`, calls `run_crystallizer_stage()` directly with `config.llm_provider == "gemini"` instead of building a seedling for the Mac |
+| **File delivery** | `vault.build_vault_files()` builds Capture/Source/MOC file contents in memory (no local vault access on the droplet) → `_upload_to_spaces()` pushes them straight to Spaces `incoming/` |
+| **Pull side** | `vault_writer.py`'s `pull_pending_files()` — MOC paths get merged into the existing local file (`_merge_moc_content`) instead of overwritten, since the droplet can't know if a MOC already exists locally |
+| **Phone delivery independent of Mac** | The same Spaces `incoming/` prefix is also polled directly by the "Remotely Save" Obsidian plugin on the phone — cloud captures can appear on the phone even with the Mac fully off |
+
+#### Stage 2 cascade routing
+
+`processor._select_gemini_synthesis_model(meta, anchor_count, config)` picks per-capture, cheap tier by default — 2026 LLM-routing best practice is to route the obvious majority cheap and escalate only what needs it, rather than pre-classifying everything through a trained router ([digitalapplied.com](https://www.digitalapplied.com/blog/llm-model-routing-2026-cost-quality-optimization-engineering-guide), [leanlm.ai](https://leanlm.ai/blog/llm-model-routing)):
+
+| Tier | Model (config field) | When used |
+|---|---|---|
+| Cheap (default) | `gemini_synthesis_model` = `gemini-3.7-flash` | Everything else — the majority: short web articles, text, short video |
+| Quality (escalation) | `gemini_synthesis_model_quality` = `gemini-3.1-pro-preview` | `source_type == "pdf"`, video ≥3600s, or ≥5 mandatory technical anchors — content a real quality-comparison test showed the cheap tier under-extracts on. Also escalated to on any JSON parse failure in `_parse_and_repair`'s repair path — a cheap-tier miss is itself evidence the content was harder than expected. |
+
+`ProcessingResult.model_used` records which tier actually ran (reflects the primary attempt; a rare repair-path escalation isn't separately distinguished, since `_parse_and_repair` doesn't report which attempt succeeded) and flows into both the `llm_model:` frontmatter field and `vault._model_suffix()` — escalated notes get a filename suffix (e.g. `-preview`), default-tier notes stay unsuffixed so the common case keeps clean filenames.
+
+**Cost**: no spend cap — opt-in is the guardrail. Measured against a real web-article capture (6,482 input / 4,690 output tokens, incl. thinking): **~$0.022/capture** on the cheap tier vs **~$0.069/capture** on the quality tier — the cascade keeps the common case near the cheap-tier price while still escalating dense/long content. Longer sources cost proportionally more regardless of tier. Stage 1 relay cost is separate and unaffected. Gemini 2.5+ models get automatic implicit prompt-prefix caching, but it needs ≥4,096 matching prefix tokens to trigger (confirmed against [ai.google.dev/gemini-api/docs/caching](https://ai.google.dev/gemini-api/docs/caching)) — the static `SYSTEM_PROMPT` alone is ~1,822 tokens, under that bar on its own, so it likely isn't actually benefiting today. Explicit caching (as Stage 1 already uses, 1,024-token minimum) would clear it, but the per-hour storage fee only pays off under bursty capture patterns — not worth building for occasional use.
+
+### 4b. Concurrency — bounded, not unbounded
+
+`/capture`'s cloud-mode branch returns immediately via a `BackgroundTask`, so posting several captures back-to-back queues several `_process_job()` runs on the droplet's single event loop. Two protections keep this safe rather than racing:
+
+- **`_job_semaphore` (limit 2)** bounds how many full pipeline runs (Stage 1 + Stage 2 Gemini calls) execute concurrently — extra jobs queue behind the semaphore instead of firing an unbounded burst at the Gemini API, which is what actually risks a capture silently failing (rate-limit error). Applies to both the full-cloud path and the seedling-relay path, since both call Gemini for Stage 1. Job status (`_jobs[job_id]`) is set to `"processing"` before the semaphore is ever awaited, so `/result/{job_id}` correctly shows queued jobs immediately, not just running ones.
+- **MOC read-merge-write** (`_upload_to_spaces()`) — two concurrent captures that both touch the same MOC (e.g. same topic) each independently build a full "MOC doesn't exist yet" version in memory (the droplet has no local vault to check against). Without a merge step, whichever job's `PUT` lands second on Spaces would silently overwrite the first job's links. Fixed by GET-ing the current Spaces object under the existing per-filename `asyncio.Lock` and merging in only the new `- [[...]]` lines before writing back — verified with a simulated concurrent-write test (two fake-concurrent uploads to the same MOC filename, both sets of links present in the final content, no loss).
+
+A `_process_job()` failure (e.g. a transient API error) is still caught by the outer `try/except` and recorded as `_jobs[job_id] = {"status": "failed", ...}` — it won't hang forever, but note the iOS Shortcut doesn't currently poll `/result/{job_id}` to surface that failure to the phone; a failed capture is silently absent from the vault unless someone checks server logs or queries the job directly.
+
+Standard (local) captures don't need any of this — `seedling_{job_id}.json` filenames are collision-free per job, and `watcher.py`'s serial worker (already verified single-concurrency) processes whatever lands in `Seedlings/` one at a time regardless of how fast they arrive.
+
 ---
 
 ## 5. Research Topic Pipeline — Sequential Smart Loop
@@ -331,29 +368,24 @@ Post-synthesis cooldown: 120s (14B) / 30s (9B). MLX model freed via `free_mlx_mo
 
 ---
 
-## 15. iOS Shortcut — Nexus v6.0 (Three Surfaces)
+## 15. iOS Shortcut — Nexus v6.6 (Share Sheet)
 
-Single `.shortcut` file (`shortcuts/build_v6.py`) handling all input surfaces:
+Single `.shortcut` file (`shortcuts/build_v6.py`), one surface: the share sheet.
 
 ```
-[Shortcut Input has value?]
-│
-├─ YES (share sheet from any app)
-│   └─ POST /capture {url: ExtensionInput} → full synthesis pipeline
-│
-└─ NO (direct launch from home screen or Action Button)
-    └─ Instant menu: [📝 Note / URL | 🎙️ Record Audio]
+Share sheet (Safari, YouTube, Instagram…)
+  └─ "Capture Mode" menu: [📝 Standard Capture | ☁️ Cloud Capture]
         │
-        ├─ 📝 Note / URL
-        │   └─ Ask for text → POST /capture_smart {text}
-        │       Server routes: "RQ " → research, URL → pipeline, else → fleeting
+        ├─ 📝 Standard Capture
+        │   └─ POST /capture {url: ExtensionInput, return_files: true}
+        │       → seedling queued for Stage 2 on the Mac (watcher.py)
         │
-        └─ 🎙️ Record Audio
-            └─ Record → base64 encode → POST /capture_voice_fleeting {audio_b64}
-                Server: Groq Whisper → fleeting note (+ research queue if "RQ " spoken)
+        └─ ☁️ Cloud Capture
+            └─ POST /capture {url, return_files: true, provider: "gemini"}
+                → both stages run on the droplet (§4a) — no Mac required
 ```
 
-**Action Button**: configure to run this shortcut. Menu appears in < 0.3s; one tap to 🎙️. iOS does not support native tap-vs-hold differentiation on home screen icons — the instant menu is the implementation-correct solution.
+`/capture_smart` and `/capture_voice_fleeting` (used by the Sync Bridge diagram below) are live server routes with no client surface currently wired to them in this shortcut — a known gap, not part of this version's scope.
 
 ---
 
@@ -464,6 +496,15 @@ Obsidian Vault (local iCloud Drive) → iCloud sync → iPhone Obsidian app
 | Voice → research | Not present | "RQ " spoken → Groq transcribes → research queue + fleeting save |
 | Dedup gate position | Not present | Runs post-extraction, pre-Gemini (saves API cost on duplicates) |
 | `find_all_related_pairs` | Dead reference in `/related` | Implemented: numpy pairwise over LanceDB embeddings |
+
+### v6.5 → v6.6 Delta
+
+| Feature | v6.5 | v6.6 |
+|---|---|---|
+| Full-cloud capture path | Not present — Stage 2 always local | `llm_provider == "gemini"` (§4a): both stages via Gemini, no Mac required |
+| iOS Shortcut | Share sheet → `/capture`, no mode choice | Share sheet → "Capture Mode" menu: 📝 Standard / ☁️ Cloud Capture (§15) |
+| `build_vault_files()` | Deleted in an earlier cleanup pass (dead at the time) | Rebuilt — in-memory note/MOC file builder for server-side (no local vault) writes |
+| `vault_writer.py` MOC pulls | Blind overwrite of `MOCs/*.md` | Merges incoming links into existing local MOC file (`_merge_moc_content`) |
 
 ---
 

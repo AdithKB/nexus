@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-watcher.py — Local Crystallizer for Nexus v4.0 (March 2026)
+watcher.py — Local Crystallizer for Nexus v6.5
 Monitors for '.seedling.json' files from the Cloud Relay.
 
 Author: Adith K B
@@ -22,7 +22,7 @@ from watchdog.events import FileSystemEventHandler
 from config import Config
 from extractors import SourceMeta
 from processor import run_crystallizer_stage, free_mlx_model, prewarm_mlx_model
-from vault import build_vault_files, write_to_vault, check_duplicate
+from vault import write_to_vault, check_duplicate
 from embed_store import EmbedStore
 from dedup_gate import DedupGate
 
@@ -51,40 +51,6 @@ def _get_thermal_level() -> int:
     except Exception:
         return 0
 
-
-def _count_anchors(relay_description: str) -> int:
-    """Count mandatory technical anchors in the relay description.
-    Handles both JSON format (mandatory_technical_anchors array) and legacy markdown (^- lines).
-    """
-    import re
-    try:
-        import json as _json
-        data = _json.loads(relay_description)
-        if isinstance(data, dict) and "mandatory_technical_anchors" in data:
-            return len(data["mandatory_technical_anchors"])
-    except Exception:
-        pass
-    return len(re.findall(r"^- ", relay_description, re.MULTILINE))
-
-
-def _select_model(config: Config, source_type: str, duration_sec: int,
-                  relay_description: str = "") -> str:
-    """
-    Choose between quality (14B) and fast (9B) Qwen3.5 model.
-
-    Rules (in priority order):
-      PDF                         →  14B (deep context)
-      video >= 1 hour             →  14B (long content)
-      anchor density >= 5 anchors →  14B (dense technical content, 9B drops claims)
-      Everything else             →  9B  (~2× faster)
-    """
-    if source_type == "pdf":
-        return config.ollama_model
-    if source_type in ("youtube", "instagram") and duration_sec >= 3600:
-        return config.ollama_model
-    if relay_description and _count_anchors(relay_description) >= 5:
-        return config.ollama_model
-    return config.ollama_model_fast
 
 # ── Configuration ─────────────────────────────────────────────
 
@@ -227,20 +193,26 @@ class SeedlingHandler(FileSystemEventHandler):
             source_type = meta_dict.get("source_type", "web")
             duration_sec = int(meta_dict.get("duration_sec") or 0)
 
-            # 2. Semantic dedup gate — disabled in watcher (model2vec/loky leaks POSIX semaphores
-            # that cause SIGSEGV in Ollama HTTP calls; server-side dedup already prevents duplicates)
+            # 2. Semantic dedup gate — re-enabled now that LOKY_MAX_CPU_COUNT=1 (set at the
+            # top of this file, before any imports) prevents the model2vec/loky POSIX
+            # semaphore leak that used to SIGSEGV subsequent native library calls
+            # (LanceDB/MLX). Server-side dedup catches most duplicates before a seedling
+            # is even created; this is a second check for anything that slips through.
             dedup_key = data.get("url") or meta_dict.get("source_id", file_path.stem)
-            dedup_outcome, dedup_matches = "proceed", []
-            if dedup_outcome == "skip":
-                print(
-                    f"[DEDUP] Skipping near-duplicate (sim ≥ 0.92): previously seen as {dedup_matches[0]!r}",
-                    flush=True,
-                )
-                self.processed.add(file_path)
-                file_path.unlink(missing_ok=True)
-                return
-            if dedup_outcome == "flag":
-                print(f"[DEDUP] Related content (sim ≥ 0.75): {dedup_matches}", flush=True)
+            dedup_matched: list = []
+            if self.dedup_gate and self.config.dedup_enabled:
+                verdict, dedup_matched = self.dedup_gate.check(dedup_key, description)
+                if verdict == "skip":
+                    print(
+                        f"[DEDUP] Skipping near-duplicate (sim ≥ 0.92): previously seen as {dedup_matched}",
+                        flush=True,
+                    )
+                    self.processed.add(file_path)
+                    file_path.unlink(missing_ok=True)
+                    self.processing.discard(file_path)
+                    return
+                if verdict == "flag":
+                    print(f"[DEDUP] Related content (sim ≥ 0.75): {dedup_matched}", flush=True)
 
             # 4. Reconstruct SourceMeta — no re-extraction needed
             meta = SourceMeta(
@@ -252,10 +224,14 @@ class SeedlingHandler(FileSystemEventHandler):
                 transcript=meta_dict.get("transcript", ""),
                 source_id=meta_dict.get("source_id", "local-id"),
             )
+            if dedup_matched:
+                meta.related_captures = dedup_matched
 
-            # 5. Model routing: always 14B until native-crash diagnosis complete (9B fails structured JSON)
+            # 5. Model routing: always 14B until native-crash diagnosis complete (9B fails structured
+            # JSON; MLX disabled — crashes at startup on this machine, mlx_lm import SIGSEGV)
             chosen_model = self.config.ollama_model
             tier = "14B (quality)"
+            is_quality_path = True
             print(
                 f"[CRYSTALLIZER] {meta.title[:60]} | {source_type} "
                 f"| {duration_sec}s → {tier}",
@@ -265,23 +241,14 @@ class SeedlingHandler(FileSystemEventHandler):
             # Clone config so we don't mutate the shared instance
             import copy
             local_config = copy.copy(self.config)
-            is_quality_path = chosen_model == self.config.ollama_model
-
-            if is_quality_path:
-                local_config.llm_provider = "ollama"
-                local_config.ollama_model = chosen_model
-            else:
-                # MLX disabled: crashes at startup on this machine (mlx_lm import SIGSEGV)
-                # Using Ollama qwen3.5:9b as 9B fast path until MLX is diagnosed
-                local_config.llm_provider = "ollama"
-                local_config.ollama_model = self.config.ollama_model_fast
+            local_config.llm_provider = "ollama"
+            local_config.ollama_model = chosen_model
 
             # 6. Run Stage 2 with a hard timeout to prevent GPU hangs from freezing the system
             # 9B synthesis: typical 30-60s, timeout at 240s
             # 14B synthesis: typical 90-180s, timeout at 480s
             synthesis_timeout = 480 if is_quality_path else 240
 
-            print(f"[WATCHER-DBG] provider={local_config.llm_provider} model={getattr(local_config,'ollama_model','?')}", flush=True)
             try:
                 result = await asyncio.wait_for(
                     run_crystallizer_stage(
@@ -310,9 +277,9 @@ class SeedlingHandler(FileSystemEventHandler):
                 # Index new notes into LanceDB so MCP search_vault finds them
                 notes_to_index = [
                     {
-                        "title":     note.suggested_title or note.content[:60],
-                        "aliases":   [],
-                        "tags":      list(note.keywords or []),
+                        "title":     note.title,
+                        "aliases":   note.aliases,
+                        "tags":      note.tags,
                         "note_type": note.note_type or "fact",
                     }
                     for note in result.atomic_notes
@@ -324,7 +291,11 @@ class SeedlingHandler(FileSystemEventHandler):
                 except Exception as _ie:
                     print(f"[EMBED] Index update skipped: {_ie}", flush=True)
 
-                # dedup_gate.index disabled — model2vec/loky causes SIGSEGV after synthesis
+                if self.dedup_gate and self.config.dedup_enabled:
+                    try:
+                        self.dedup_gate.index(dedup_key, description, title=meta.title)
+                    except Exception as _de:
+                        print(f"[DEDUP] Index update skipped: {_de}", flush=True)
 
                 # Quality signal: warn when integrity gate had to recover many anchors
                 # (indicates model missed significant technical content)
@@ -580,7 +551,11 @@ async def main():
     # 3. Set up queue + handler
     loop = asyncio.get_event_loop()
     queue: asyncio.Queue = asyncio.Queue()
-    event_handler = SeedlingHandler(config, embed_store, queue, loop)
+    dedup_gate = DedupGate(
+        skip_threshold=config.dedup_skip_threshold,
+        flag_threshold=config.dedup_flag_threshold,
+    )
+    event_handler = SeedlingHandler(config, embed_store, queue, loop, dedup_gate=dedup_gate)
 
     # 4. Start filesystem watcher
     observer = Observer()

@@ -382,12 +382,7 @@ def extract_voice_memo(audio_path: Path, config: "Config") -> "SourceMeta":
 
     transcript = _clean_transcript(transcript)
     quality = _score_transcript(transcript)
-    if quality["is_poor_quality"]:
-        print(
-            f"[VOICE] ⚠ Low-quality transcript "
-            f"(ttr={quality['ttr']:.3f}, punct={quality['punctuation_density']:.3f})",
-            flush=True,
-        )
+    _log_transcript_quality(quality, tag="VOICE")
 
     now = _dt.now()
     return SourceMeta(
@@ -457,6 +452,18 @@ def _score_transcript(text: str) -> dict:
     }
 
 
+def _log_transcript_quality(tq: dict, tag: str = "EXTRACTOR") -> None:
+    """Print the standard low-quality-transcript warning if tq flags it."""
+    if not tq["is_poor_quality"]:
+        return
+    print(
+        f"[{tag}] Low-quality transcript detected "
+        f"(punct={tq['punctuation_density']:.3f}, ttr={tq['ttr']:.3f}, "
+        f"repetition={tq['repetition_ratio']:.3f})",
+        flush=True,
+    )
+
+
 def extract_youtube(url: str, config: Config | None = None) -> SourceMeta:
     """
     Extract transcript + metadata from YouTube.
@@ -499,13 +506,7 @@ def extract_youtube(url: str, config: Config | None = None) -> SourceMeta:
 
     cleaned = _clean_transcript(transcript)
     tq = _score_transcript(cleaned)
-    if tq["is_poor_quality"]:
-        print(
-            f"[EXTRACTOR] Low-quality transcript detected "
-            f"(punct={tq['punctuation_density']:.3f}, ttr={tq['ttr']:.3f}, "
-            f"repetition={tq['repetition_ratio']:.3f})",
-            flush=True,
-        )
+    _log_transcript_quality(tq)
     return SourceMeta(
         title=meta["title"],
         url=canonical,
@@ -610,6 +611,18 @@ def _apify_fetch_instagram(clean_url: str, apify_key: str) -> dict:
     return {}
 
 
+def _download_video_to_tempfile(video_url: str, suffix: str = ".mp4") -> str:
+    """Download a video URL to a tempfile. Returns the path; raises if the download is empty."""
+    import urllib.request as _ur
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    tmp.close()
+    _ur.urlretrieve(video_url, tmp.name)
+    if Path(tmp.name).stat().st_size == 0:
+        Path(tmp.name).unlink(missing_ok=True)
+        raise ValueError("downloaded file is empty")
+    return tmp.name
+
+
 def _extract_instagram(url: str, apify_api_key: str = "") -> SourceMeta:
     """
     Instagram Reels adapter — downloads the actual video for Gemini visual analysis.
@@ -639,17 +652,9 @@ def _extract_instagram(url: str, apify_api_key: str = "") -> SourceMeta:
         caption = rapid_meta.get("caption", "")
         if video_url:
             try:
-                tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-                tmp.close()
-                import urllib.request as _ur
-                _ur.urlretrieve(video_url, tmp.name)
-                size = Path(tmp.name).stat().st_size
-                if size > 0:
-                    video_path = tmp.name
-                    print(f"[INSTAGRAM] RapidAPI download OK: {size // 1024}KB", flush=True)
-                else:
-                    Path(tmp.name).unlink(missing_ok=True)
-                    print("[INSTAGRAM] RapidAPI returned empty file, trying Apify", flush=True)
+                video_path = _download_video_to_tempfile(video_url)
+                size = Path(video_path).stat().st_size
+                print(f"[INSTAGRAM] RapidAPI download OK: {size // 1024}KB", flush=True)
             except Exception as e:
                 print(f"[INSTAGRAM] RapidAPI video download error: {e}, trying Apify", flush=True)
         else:
@@ -663,16 +668,9 @@ def _extract_instagram(url: str, apify_api_key: str = "") -> SourceMeta:
         video_url = apify_meta.get("videoUrl", "")
         if video_url and not video_path:
             try:
-                tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-                tmp.close()
-                import urllib.request as _ur
-                _ur.urlretrieve(video_url, tmp.name)
-                size = Path(tmp.name).stat().st_size
-                if size > 0:
-                    video_path = tmp.name
-                    print(f"[INSTAGRAM] Apify download OK: {size // 1024}KB", flush=True)
-                else:
-                    Path(tmp.name).unlink(missing_ok=True)
+                video_path = _download_video_to_tempfile(video_url)
+                size = Path(video_path).stat().st_size
+                print(f"[INSTAGRAM] Apify download OK: {size // 1024}KB", flush=True)
             except Exception as e:
                 print(f"[INSTAGRAM] Apify video download error: {e}", flush=True)
         elif not video_url:
@@ -793,13 +791,7 @@ def _extract_podcast(url: str, config: Config) -> SourceMeta:
 
     cleaned = _clean_transcript(transcript)
     tq = _score_transcript(cleaned)
-    if tq["is_poor_quality"]:
-        print(
-            f"[EXTRACTOR] Low-quality transcript detected "
-            f"(punct={tq['punctuation_density']:.3f}, ttr={tq['ttr']:.3f}, "
-            f"repetition={tq['repetition_ratio']:.3f})",
-            flush=True,
-        )
+    _log_transcript_quality(tq)
     return SourceMeta(
         title=meta.get("title", "Podcast Episode"),
         url=url,

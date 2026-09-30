@@ -27,6 +27,7 @@ from typing import Optional
 
 try:
     import boto3
+    from botocore.config import Config as _BotoConfig
     from botocore.exceptions import BotoCoreError, ClientError
     _BOTO3_AVAILABLE = True
 except ImportError:
@@ -173,13 +174,25 @@ def _load_vault_index():
 
 
 def _spaces_client(config):
-    """Build a boto3 S3 client pointed at DigitalOcean Spaces."""
+    """Build a boto3 S3 client pointed at the configured object storage provider.
+
+    request_checksum_calculation="when_required" disables botocore's default
+    AWS-chunked streaming checksums on PutObject (opt-in default since
+    botocore 1.36) — non-AWS S3-compatible providers (Oracle Object Storage,
+    many others) reject that with "NotImplemented: AWS chunked encoding not
+    supported". DigitalOcean Spaces tolerated it; Oracle doesn't.
+    """
+    endpoint = config.spaces_endpoint_url or f"https://{config.spaces_region}.digitaloceanspaces.com"
     return boto3.client(
         "s3",
-        endpoint_url=f"https://{config.spaces_region}.digitaloceanspaces.com",
+        endpoint_url=endpoint,
         aws_access_key_id=config.spaces_access_key,
         aws_secret_access_key=config.spaces_secret_key,
         region_name=config.spaces_region,
+        config=_BotoConfig(
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+        ),
     )
 
 

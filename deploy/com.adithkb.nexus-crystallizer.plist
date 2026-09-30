@@ -7,14 +7,14 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/adithkb/MSAI/PersonalProjects/AgenticPKM/AgenticPKMApp/stealth_crystallizer.sh</string>
+        <string>/Users/adithkb/Ireland/PersonalProjects/AgenticPKM/AgenticPKMApp/stealth_crystallizer.sh</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>WorkingDirectory</key>
-    <string>/Users/adithkb/MSAI/PersonalProjects/AgenticPKM/AgenticPKMApp</string>
+    <string>/Users/adithkb/Ireland/PersonalProjects/AgenticPKM/AgenticPKMApp</string>
     <key>StandardOutPath</key>
     <string>/tmp/nexus-crystallizer.log</string>
     <key>StandardErrorPath</key>

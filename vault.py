@@ -139,8 +139,15 @@ def check_duplicate(url: str, config: Config) -> bool:
 
 
 def _yaml_list(items: list[str]) -> str:
-    """Format list for YAML frontmatter: [item1, item2, item3]"""
-    escaped = [item.replace('"', '\\"') for item in items]
+    """Format list for YAML frontmatter: ["item1", "item2", "item3"].
+
+    Each item is double-quoted (not just internally escaped) — a raw source
+    caption used as an alias routinely contains YAML flow-sequence-breaking
+    characters (?, :, #, bare commas), which corrupted the frontmatter of
+    several notes before this fix. Backslashes are escaped before quotes so
+    a literal backslash in text doesn't itself break the escape sequence.
+    """
+    escaped = ['"' + item.replace('\\', '\\\\').replace('"', '\\"') + '"' for item in items]
     return "[" + ", ".join(escaped) + "]"
 
 
@@ -200,7 +207,10 @@ def _format_atomic_note(
     # grab just "1" instead of the actual first step.
     _summary_source = re.sub(r"^\d+\.\s*", "", (note.content or "").strip())
     first_sentence = _summary_source.split(".")[0].strip()
-    summary_line = f'summary: "{first_sentence}."' if first_sentence else ""
+    # Escape backslashes then quotes — a claim quoting source text ("the 'To Do
+    # Today' list") previously broke the YAML double-quoted scalar outright.
+    _summary_esc = first_sentence.replace('\\', '\\\\').replace('"', '\\"')
+    summary_line = f'summary: "{_summary_esc}."' if first_sentence else ""
 
     source_quote = getattr(note, "source_quote", "") or ""
 

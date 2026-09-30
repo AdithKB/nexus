@@ -1,0 +1,37 @@
+# Linux-safe subset of requirements.txt for the relay server (server.py).
+# Excludes mlx-textgen (Apple Silicon/macOS only, never imported server-side —
+# processor.py only imports mlx_lm inside the llm_provider=="mlx" branch,
+# which the full-cloud path never takes) and other Mac/local-only packages.
+
+# Core
+httpx>=0.27
+pydantic>=2.0
+requests>=2.31
+numpy>=1.26
+python-dotenv>=1.0
+
+# YouTube extraction
+youtube-transcript-api>=1.2.0
+yt-dlp>=2024.12.0
+
+# Web extraction (BS4 fallback for when Jina is down)
+beautifulsoup4>=4.12
+markdownify>=0.13
+
+# PDF extraction (Tier 1/2 — Tier 0 Marker skipped by default, see MARKER_ENABLED)
+pymupdf>=1.24
+pymupdf4llm>=0.0.17
+
+# Webhook server
+fastapi>=0.111
+uvicorn[standard]>=0.29
+
+# Object storage upload (Mac-off bridge) — any S3-compatible provider
+boto3>=1.34
+
+# Gemini (Stage 1 relay + full-cloud Stage 2 synthesis)
+google-genai>=1.0.0
+
+# Vector store (embed_store.py) + semantic dedup gate (dedup_gate.py)
+lancedb>=0.13
+model2vec>=0.3

@@ -100,18 +100,29 @@ class Config:
     pdf_max_pages: int = 40          # hard cap on pages extracted
     pdf_chunk_chars: int = 60000     # max chars sent to LLM
 
-    # ── DigitalOcean Spaces (Mac-Off bridge) ──────────────────
+    # ── Object Storage (Mac-Off bridge) ───────────────────────
     # Server uploads completed notes here; iPhone Remotely Save plugin pulls them.
-    # Leave blank to disable Spaces upload (falls back to Mac vault_writer.py only).
+    # Leave blank to disable upload (falls back to Mac vault_writer.py only).
+    # Works with any S3-compatible provider — DigitalOcean Spaces, Oracle Object
+    # Storage, Cloudflare R2, etc. — via SPACES_ENDPOINT_URL.
     #
-    # Setup:
+    # Setup (DigitalOcean Spaces):
     #   1. Create a Space in your DO account (e.g. region=nyc3, name=nexus-vault)
     #   2. Generate two API keys under API → Spaces Keys:
     #      - Server key: Read+Write  → set below
     #      - Phone key:  Read-only   → use in Remotely Save on iPhone
+    #   3. Leave SPACES_ENDPOINT_URL blank — defaults to
+    #      https://<SPACES_REGION>.digitaloceanspaces.com
     #
-    # Remotely Save settings:
-    #   Endpoint  = https://<SPACES_REGION>.digitaloceanspaces.com
+    # Setup (Oracle Object Storage, S3-compatible API):
+    #   1. Create a bucket in the OCI console (Object Storage → Buckets)
+    #   2. Generate a Customer Secret Key under Identity → Users → <you> →
+    #      Customer Secret Keys → set as SPACES_ACCESS_KEY / SPACES_SECRET_KEY
+    #   3. Set SPACES_ENDPOINT_URL = https://<namespace>.compat.objectstorage.<region>.oraclecloud.com
+    #      (namespace is shown at the top of the Buckets page)
+    #
+    # Remotely Save settings (iPhone):
+    #   Endpoint  = SPACES_ENDPOINT_URL (or the DO default above if blank)
     #   Bucket    = <SPACES_BUCKET>
     #   Remote Base Dir = _incoming   ← maps _incoming/ in Spaces to vault root
     spaces_region: str = os.getenv("SPACES_REGION", "nyc3")  # e.g. nyc3, sfo3, ams3
@@ -119,6 +130,7 @@ class Config:
     spaces_secret_key: str = os.getenv("SPACES_SECRET_KEY", "")
     spaces_bucket: str = os.getenv("SPACES_BUCKET", "nexus-vault")
     spaces_prefix: str = os.getenv("SPACES_PREFIX", "incoming")  # maps to vault root
+    spaces_endpoint_url: str = os.getenv("SPACES_ENDPOINT_URL", "")  # blank = DO Spaces default
 
     # ── Web Extraction ────────────────────────────────────────
     jina_api_key: str = os.getenv("JINA_API_KEY", "")  # optional, free tier works

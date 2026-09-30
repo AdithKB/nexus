@@ -19,7 +19,7 @@ brew install yt-dlp
 
 ### 2. Configure
 
-Copy `.env.example` to `.env` and fill in your keys (Gemini, Jina, DigitalOcean Spaces, etc.) — see `config.py` for every field and its default.
+Copy `.env.example` to `.env` and fill in your keys (Gemini, Jina, object storage, etc.) — see `config.py` for every field and its default. Object storage is any S3-compatible provider (Oracle Object Storage, DigitalOcean Spaces, Cloudflare R2, ...) via `SPACES_ENDPOINT_URL`.
 
 ### 3. Start local inference
 
@@ -45,7 +45,7 @@ python capture.py --url "./paper.pdf" --notes 10
 python capture.py --batch urls.txt
 ```
 
-Or run the full pipeline as a webhook server (`python server.py`) for the iOS Shortcut / remote capture flow — see `deploy/` for the DigitalOcean droplet setup (Caddy + systemd unit + LaunchAgents).
+Or run the full pipeline as a webhook server (`python server.py`) for the iOS Shortcut / remote capture flow — see `deploy/` for the relay server setup (Caddy + systemd unit + LaunchAgents). Currently hosted on Oracle Cloud's Always Free tier; `deploy/oracle_setup.sh` bootstraps a fresh Ubuntu VM end to end.
 
 ---
 
@@ -57,7 +57,7 @@ AgenticPKMApp/
 ├── vault.py, vault_writer.py, embed_store.py              # vault + storage
 ├── dedup_gate.py, dreamer.py, compressor.py                # supporting agents
 ├── config.py, server.py, mcp_nexus.py, reflector_tier1.py
-├── deploy/       # LaunchAgents, Caddyfile, droplet systemd unit
+├── deploy/       # LaunchAgents, Caddyfile, relay server systemd unit + Oracle bootstrap script
 ├── docs/         # architecture.md (current), this file, research notes
 ├── scripts/      # vault maintenance CLIs (dedup, reindex)
 ├── shortcuts/    # iOS Shortcut builder (build_v6.py — current)

@@ -108,7 +108,12 @@ def _parse_frontmatter(text: str) -> dict:
         matched_field = next((f for f in ("aliases", "tags") if line.startswith(f"{f}:")), None)
         if matched_field:
             raw = line.split(f"{matched_field}:", 1)[1].strip()
-            items = re.findall(r'"([^"]+)"|\'([^\']+)\'|([^,\[\]]+)', raw)
+            # The bare-item branch must exclude quote chars — otherwise, once
+            # scanning lands between two quoted items (e.g. the space after a
+            # comma), it greedily swallows straight through the next item's
+            # opening quote as literal content instead of yielding to the
+            # quoted-item branch, embedding stray `"..."` in the parsed value.
+            items = re.findall(r'"([^"]+)"|\'([^\']+)\'|([^,\[\]"\']+)', raw)
             result[matched_field] = [
                 (a or b or c).strip() for a, b, c in items if (a or b or c).strip()
             ]

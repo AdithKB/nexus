@@ -1,4 +1,4 @@
-# Nexus v6.0: Architecture Reference (June 2026)
+# Nexus v6.7: Architecture Reference (September 2026)
 
 ## 1. Design Philosophy — Passive Sovereign
 
@@ -60,7 +60,9 @@ Full pipeline path for audio: Groq Whisper transcription → `run_relay_stage` �
 
 ## 3. Two-Stage Pipeline
 
-### Stage 1 — The Relay (DigitalOcean droplet)
+### Stage 1 — The Relay (Oracle Cloud VM)
+
+Hosted on an Oracle Cloud Always Free `VM.Standard.A1.Flex` instance (4 OCPU/24GB, Ubuntu 24.04 ARM) as of 2026-09-30 — migrated off a DigitalOcean droplet after it was disabled for non-payment. Same code, same `nexus.adithkb.dev` hostname (DNS A record repointed); see §4a for the provider-agnostic object storage layer this motivated.
 
 | Property | Value |
 |---|---|
@@ -121,16 +123,18 @@ source_type == "fleeting"                         →  skipped entirely (no LLM)
 
 ### 4a. Full-Cloud Capture Path (`llm_provider == "gemini"`)
 
-Opt-in per-capture escape hatch for when the Mac is off, asleep, or unreachable — both stages run on the droplet via Gemini, so the note finishes without the Mac at all. Triggered by the iOS Shortcut's "☁️ Cloud Capture" menu choice, which adds `"provider": "gemini"` to the `/capture` POST body; `build_config(provider=req.provider, ...)` threads it into `Config.llm_provider`.
+Opt-in per-capture escape hatch for when the Mac is off, asleep, or unreachable — both stages run on the relay server via Gemini, so the note finishes without the Mac at all. Triggered by the iOS Shortcut's "☁️ Cloud Capture" menu choice, which adds `"provider": "gemini"` to the `/capture` POST body; `build_config(provider=req.provider, ...)` threads it into `Config.llm_provider`.
 
 | Property | Value |
 |---|---|
 | **Stage 1 model** | `gemini_model` — same `gemini-3.1-flash-lite-preview` extraction tier as the default path |
 | **Stage 2 model** | Cascade-routed by `_select_gemini_synthesis_model()` — see below |
 | **Where it runs** | `server.py`'s `_process_job()` — after `run_relay_stage()`, calls `run_crystallizer_stage()` directly with `config.llm_provider == "gemini"` instead of building a seedling for the Mac |
-| **File delivery** | `vault.build_vault_files()` builds Capture/Source/MOC file contents in memory (no local vault access on the droplet) → `_upload_to_spaces()` pushes them straight to Spaces `incoming/` |
-| **Pull side** | `vault_writer.py`'s `pull_pending_files()` — MOC paths get merged into the existing local file (`_merge_moc_content`) instead of overwritten, since the droplet can't know if a MOC already exists locally |
-| **Phone delivery independent of Mac** | The same Spaces `incoming/` prefix is also polled directly by the "Remotely Save" Obsidian plugin on the phone — cloud captures can appear on the phone even with the Mac fully off |
+| **File delivery** | `vault.build_vault_files()` builds Capture/Source/MOC file contents in memory (no local vault access on the relay server) → `_upload_to_spaces()` pushes them straight to object storage `incoming/` |
+| **Pull side** | `vault_writer.py`'s `pull_pending_files()` — MOC paths get merged into the existing local file (`_merge_moc_content`) instead of overwritten, since the relay server can't know if a MOC already exists locally |
+| **Phone delivery independent of Mac** | The same object storage `incoming/` prefix is also polled directly by the "Remotely Save" Obsidian plugin on the phone — cloud captures can appear on the phone even with the Mac fully off |
+
+**Storage provider is S3-compatible and swappable** (`config.py`'s `spaces_*` fields, `server.py::_spaces_client()`): originally DigitalOcean Spaces, migrated to **Oracle Object Storage** on 2026-09-30 alongside the compute move. `SPACES_ENDPOINT_URL` picks the provider — blank defaults to DO Spaces, set it to `https://<namespace>.compat.objectstorage.<region>.oraclecloud.com` for Oracle (or any other S3-compatible endpoint, e.g. Cloudflare R2). One migration-specific fix required: botocore ≥1.36 defaults `PutObject` to AWS-chunked streaming checksums, which non-AWS providers reject with `NotImplemented: AWS chunked encoding not supported` — fixed by passing `botocore.config.Config(request_checksum_calculation="when_required", response_checksum_validation="when_required")` into the boto3 client.
 
 #### Stage 2 cascade routing
 
@@ -147,10 +151,10 @@ Opt-in per-capture escape hatch for when the Mac is off, asleep, or unreachable 
 
 ### 4b. Concurrency — bounded, not unbounded
 
-`/capture`'s cloud-mode branch returns immediately via a `BackgroundTask`, so posting several captures back-to-back queues several `_process_job()` runs on the droplet's single event loop. Two protections keep this safe rather than racing:
+`/capture`'s cloud-mode branch returns immediately via a `BackgroundTask`, so posting several captures back-to-back queues several `_process_job()` runs on the relay server's single event loop. Two protections keep this safe rather than racing:
 
 - **`_job_semaphore` (limit 2)** bounds how many full pipeline runs (Stage 1 + Stage 2 Gemini calls) execute concurrently — extra jobs queue behind the semaphore instead of firing an unbounded burst at the Gemini API, which is what actually risks a capture silently failing (rate-limit error). Applies to both the full-cloud path and the seedling-relay path, since both call Gemini for Stage 1. Job status (`_jobs[job_id]`) is set to `"processing"` before the semaphore is ever awaited, so `/result/{job_id}` correctly shows queued jobs immediately, not just running ones.
-- **MOC read-merge-write** (`_upload_to_spaces()`) — two concurrent captures that both touch the same MOC (e.g. same topic) each independently build a full "MOC doesn't exist yet" version in memory (the droplet has no local vault to check against). Without a merge step, whichever job's `PUT` lands second on Spaces would silently overwrite the first job's links. Fixed by GET-ing the current Spaces object under the existing per-filename `asyncio.Lock` and merging in only the new `- [[...]]` lines before writing back — verified with a simulated concurrent-write test (two fake-concurrent uploads to the same MOC filename, both sets of links present in the final content, no loss).
+- **MOC read-merge-write** (`_upload_to_spaces()`) — two concurrent captures that both touch the same MOC (e.g. same topic) each independently build a full "MOC doesn't exist yet" version in memory (the relay server has no local vault to check against). Without a merge step, whichever job's `PUT` lands second in object storage would silently overwrite the first job's links. Fixed by GET-ing the current object under the existing per-filename `asyncio.Lock` and merging in only the new `- [[...]]` lines before writing back — verified with a simulated concurrent-write test (two fake-concurrent uploads to the same MOC filename, both sets of links present in the final content, no loss).
 
 A `_process_job()` failure (e.g. a transient API error) is still caught by the outer `try/except` and recorded as `_jobs[job_id] = {"status": "failed", ...}` — it won't hang forever, but note the iOS Shortcut doesn't currently poll `/result/{job_id}` to surface that failure to the phone; a failed capture is silently absent from the vault unless someone checks server logs or queries the job directly.
 
@@ -382,7 +386,7 @@ Share sheet (Safari, YouTube, Instagram…)
         │
         └─ ☁️ Cloud Capture
             └─ POST /capture {url, return_files: true, provider: "gemini"}
-                → both stages run on the droplet (§4a) — no Mac required
+                → both stages run on the relay server (§4a) — no Mac required
 ```
 
 `/capture_smart` and `/capture_voice_fleeting` (used by the Sync Bridge diagram below) are live server routes with no client surface currently wired to them in this shortcut — a known gap, not part of this version's scope.
@@ -399,15 +403,15 @@ Nexus v6.0 Shortcut (iPhone)
   │  Files app   → POST /capture_file
   │  Research    → POST /research_topic
   ▼
-DigitalOcean Droplet (nexus.adithkb.dev)
+Oracle Cloud VM (nexus.adithkb.dev — formerly a DigitalOcean droplet, see §3)
   │  Stage 1 extraction (URL + File + Voice paths)
   │  Semantic dedup gate (Model2Vec, pre-Gemini)
-  │  Saves to Spaces:
+  │  Saves to object storage:
   │    seedling_*.json               → synthesis queue
   │    research_request_*.json       → research queue
   │    incoming/Fleeting/*.md        → zero-latency vault write
   ▼
-DigitalOcean Spaces (incoming/ prefix)
+Object Storage — Oracle Object Storage as of 2026-09-30, S3-compatible (incoming/ prefix)
   ▼
 vault_writer.py (Mac, polls every 30s)
   │  Routes:
@@ -506,6 +510,20 @@ Obsidian Vault (local iCloud Drive) → iCloud sync → iPhone Obsidian app
 | `build_vault_files()` | Deleted in an earlier cleanup pass (dead at the time) | Rebuilt — in-memory note/MOC file builder for server-side (no local vault) writes |
 | `vault_writer.py` MOC pulls | Blind overwrite of `MOCs/*.md` | Merges incoming links into existing local MOC file (`_merge_moc_content`) |
 
+### v6.6 → v6.7 Delta (2026-09-30 — Oracle migration)
+
+The DigitalOcean droplet was disabled for non-payment (DO Spaces bucket lost with it), so the relay server moved to Oracle Cloud's Always Free tier. Provisioned entirely via the `oci` CLI (VCN, subnet, internet gateway, security list, `VM.Standard.A1.Flex` 4 OCPU/24GB instance, Object Storage bucket, Customer Secret Key) rather than the console — see `deploy/oracle_setup.sh` for the repeatable bootstrap (Caddy, venv, systemd, VM-local iptables). Same hostname (`nexus.adithkb.dev`, DNS A record repointed), same code, same architecture — this section is deployment history, not a design change.
+
+| Area | v6.6 | v6.7 |
+|---|---|---|
+| Object storage provider | DigitalOcean Spaces (hardcoded endpoint) | Any S3-compatible provider via new `SPACES_ENDPOINT_URL` (`config.py`, `server.py::_spaces_client()`) — Oracle Object Storage by default now, DO Spaces still works if `SPACES_ENDPOINT_URL` is left blank |
+| `deploy/requirements-server.txt` | Not present — droplet setup used `requirements.txt` directly (silently broken: `mlx-textgen` is Apple-Silicon-only and would fail to install on any Linux server) | New Linux-safe subset for the relay server |
+| `deploy/obsidian-capture.service` | Secrets inline as `Environment=` placeholders | `EnvironmentFile=.../  .env` — more secrets to manage now (Gemini + object storage creds) |
+| Non-AWS S3 uploads | N/A (DO Spaces tolerated boto3's default chunked-encoding) | **Fixed**: botocore ≥1.36 defaults `PutObject` to AWS-chunked streaming checksums, which Oracle Object Storage (and most non-AWS S3-compatible providers) reject with `NotImplemented`. Silently produced `"N notes, 0 files uploaded"` until `_spaces_client()` was given `botocore.config.Config(request_checksum_calculation="when_required", response_checksum_validation="when_required")`. |
+| Frontmatter YAML escaping | **Latent bug**: `vault.py::_yaml_list()` escaped internal `"` but never wrapped list items in quotes at all, and `summary:` interpolated the LLM's first sentence with zero escaping. Any alias/tag/summary containing `?`, `:`, `#`, a bare comma, or an internal quote (all routine in raw Instagram captions) silently corrupted that note's frontmatter — found via a full-vault YAML validity sweep, not by the pipeline itself. | **Fixed**: `_yaml_list()` now double-quotes every item; `summary_line` escapes internal quotes. `vault_writer.py::_parse_frontmatter()`'s regex had a second-order bug this exposed — its bare-item fallback branch didn't exclude quote characters, so once items were *correctly* quoted it would swallow straight through a later item's opening quote as literal text. Fixed by excluding `"`/`'` from that branch; verified backward-compatible with the ~470 pre-existing unquoted-style notes. |
+| Local LaunchAgents | All four (`nexus-crystallizer`, `dev.nexus.vault-writer`, `nexus-index`, plus `stealth_crystallizer.sh`'s internal path) still pointed at a project path (`~/MSAI/...`) deleted months earlier by an unrelated folder rename — silently failing on every scheduled respawn since. Discovered only because nothing had auto-synced since Aug 19. | Fixed: plists + script repointed at the current path (`~/Ireland/...`), reloaded — confirmed running clean with live PIDs. |
+| Vault content quality | 165 broken links, 326 notes missing `summary:`, 77 tag format violations, 11 under-synthesized notes (raw fragments or "Source Anchors (Unsynthesized)" dumps), 8 files with corrupted YAML | One-off cleanup pass (backed up first): links pruned (not auto-renamed — fuzzy matching tested unreliable), tags normalized, summaries backfilled via a cheap Gemini pass, under-synthesis fixed by resynthesizing from the linked Source note, YAML corruption fixed. 44 `domain/` tag misclassifications and 56 orphaned notes deliberately left for manual judgment — not mechanical fixes. |
+
 ---
 
 ## 22. Key File Map
@@ -523,10 +541,12 @@ Obsidian Vault (local iCloud Drive) → iCloud sync → iPhone Obsidian app
 | `compressor.py` | LexRank transcript compression |
 | `watcher.py` | Stage 2 daemon — watchdog, model routing, thermal guard, research loop, Dreamer trigger |
 | `server.py` | FastAPI relay — `/capture`, `/capture_smart`, `/capture_voice`, `/capture_voice_fleeting`, `/capture_text`, `/capture_file`, `/research_topic` |
-| `vault_writer.py` | Polls Spaces; routes seedlings/research/fleeting/markdown to vault |
+| `vault_writer.py` | Polls the relay server's `/pending`; routes seedlings/research/fleeting/markdown to vault |
 | `mcp_nexus.py` | MCP server v1.6 — search, graph, research, write tools, `nexus://` resources |
-| `reflector_tier1.py` | Post-capture vault audit |
+| `reflector_tier1.py` | Post-capture vault audit — broken links, tag violations, orphans, cycles; `--fix`/`--prune`/`--harmonize`/`--recover`/`--split` for automated maintenance |
 | `shortcuts/build_v5.py` | Legacy 6-option share sheet shortcut |
 | `shortcuts/build_v6.py` | **Current** — unified 3-surface shortcut (share / tap / 🎙️) |
+| `deploy/oracle_setup.sh` | Bootstraps the relay server on a fresh Oracle Always Free Ubuntu VM — Caddy, venv, systemd, VM-local iptables (§21 v6.7 delta) |
+| `deploy/requirements-server.txt` | Linux-safe subset of `requirements.txt` for the relay server (drops `mlx-textgen`, Apple-Silicon-only and never used server-side) |
 | `tools/test_new_features.py` | QA: transcript scoring, pymupdf4llm, EmbedStore, Dreamer dry-run |
 | `tools/test_voice_features.py` | QA: fleeting notes, embed_sync, `/capture_smart` intent (25 cases), Dreamer report |

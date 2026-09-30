@@ -530,6 +530,25 @@ async def _warmup_ollama(config) -> None:
               "First capture will skip cold-start.", flush=True)
 
 
+def _rescan_seedling_backlog(handler: "SeedlingHandler", queue: asyncio.Queue) -> int:
+    """
+    Re-glob Seedlings/ and re-queue anything not currently processing or done.
+
+    The startup scan (main(), step 5) only runs once per daemon launch — if that
+    single attempt fails (e.g. Ollama's own daemon hasn't finished starting yet,
+    a real race at login/wake), the watchdog observer alone won't recover it:
+    watchdog only fires on *new* filesystem events, not on files that already
+    existed before it started watching. A stuck seedling then silently sits
+    forever until the next full restart. This periodic sweep (called every 5min
+    from main()'s tick loop) closes that gap without needing a restart.
+    """
+    pending = sorted(SEEDLING_DIR.glob("seedling_*.json")) + sorted(SEEDLING_DIR.glob("research_request_*.json"))
+    requeued = [f for f in pending if f not in handler.processing and f not in handler.processed]
+    for f in requeued:
+        queue.put_nowait(f)
+    return len(requeued)
+
+
 async def main():
     # 1. Initialize
     from capture import build_config
@@ -562,12 +581,10 @@ async def main():
     observer.schedule(event_handler, str(SEEDLING_DIR), recursive=False)
     observer.start()
 
-    # 5. Startup scan — push any backlog into the queue (Mac was off, DO Spaces accumulated)
-    existing = sorted(SEEDLING_DIR.glob("seedling_*.json"))
-    if existing:
-        print(f"[CRYSTALLIZER] Startup scan: {len(existing)} pending seedling(s) queued.", flush=True)
-        for f in existing:
-            await queue.put(f)
+    # 5. Startup scan — push any backlog into the queue (Mac was off, seedlings accumulated)
+    n = _rescan_seedling_backlog(event_handler, queue)
+    if n:
+        print(f"[CRYSTALLIZER] Startup scan: {n} pending seedling(s) queued.", flush=True)
 
     # 6. Single worker serialises all synthesis — no concurrent Ollama calls, no memory spikes
     worker = asyncio.create_task(_seedling_worker(event_handler, queue))
@@ -579,6 +596,10 @@ async def main():
             tick += 1
             if tick % 60 == 0:
                 await _maybe_run_dream_session(event_handler, config, embed_store)
+            if tick % 300 == 0:
+                n = _rescan_seedling_backlog(event_handler, queue)
+                if n:
+                    print(f"[CRYSTALLIZER] Backlog rescan: re-queued {n} stuck seedling(s).", flush=True)
     except KeyboardInterrupt:
         worker.cancel()
         observer.stop()

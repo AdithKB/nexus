@@ -94,6 +94,8 @@ Hosted on an Oracle Cloud Always Free `VM.Standard.A1.Flex` instance (4 OCPU/24G
 | **Process isolation** | `LOKY_MAX_CPU_COUNT=1` set at top of `watcher.py` before any imports — forces joblib/loky into sequential mode (no subprocess workers, no leaked POSIX semaphores). Without this, the DedupGate's model2vec call leaves orphaned semaphores that cause SIGSEGV in any subsequent native library: LanceDB (Rust/Arrow), MLX (Metal), PyTorch (SentenceTransformer). |
 | **Cost** | $0.00 (local inference) |
 
+**Backlog recovery (Mac-was-off catch-up):** `watcher.py` watches `Seedlings/` with a filesystem observer (`watchdog`), which only fires on *new* events — it won't see a file that already existed before the daemon started. A one-time startup scan (`main()`, via `_rescan_seedling_backlog()`) globs the directory and queues anything already sitting there, so seedlings that accumulated while the Mac was off/asleep get picked up on wake. As of 2026-09-30, the same function also runs **every 5 minutes** from the daemon's tick loop, not just at startup — a seedling whose first processing attempt fails for a transient reason (Ollama's own daemon still starting up is a real race at login/wake; a thermal timeout; anything else caught by the generic exception handler, which deliberately leaves the file in place rather than deleting it) used to sit stuck until the next full daemon restart, since nothing else would re-queue it. Found via a genuinely stuck seedling from 2026-08-24 that sat unprocessed for over a month.
+
 ### 3a. PDF Extraction Tier Cascade
 
 Three-tier fallback in `extract_pdf()`. Each tier falls through on `ImportError` or quality failure (`len < 100`):
@@ -112,6 +114,8 @@ Marker models (`surya` + `texify`) are downloaded once (~300 MB) to `~/.cache/ma
 
 ## 4. Model Routing (Stage 2)
 
+**Intended design:**
+
 ```
 source_type == "pdf"                              →  14B quality path (Ollama)
 source_type in (youtube, instagram)
@@ -120,6 +124,8 @@ anchor_count >= 5 (dense technical content)       →  14B quality path (Ollama)
 everything else (web, text, short video)          →  9B fast path (MLX in-process)
 source_type == "fleeting"                         →  skipped entirely (no LLM)
 ```
+
+**Actual current behavior (as of 2026-09-30):** the 9B/MLX fast path is disabled — `watcher.py`'s `SeedlingHandler.process_seedling()` hardcodes `chosen_model = self.config.ollama_model` unconditionally (comment: *"always 14B until native-crash diagnosis complete — 9B fails structured JSON; MLX disabled — crashes at startup on this machine, `mlx_lm` import SIGSEGV"*). So every local capture, regardless of size, currently takes the full 14B/Ollama path (~90-180s+). Not a correctness bug — just heavier and slower than this section describes, and the MLX crash itself was never root-caused. `_mlx_generate`/`free_mlx_model` in `processor.py` are otherwise still fully implemented and would resume working the moment the 9B routing branch is re-enabled — this is a routing-level lockout, not a removed code path.
 
 ### 4a. Full-Cloud Capture Path (`llm_provider == "gemini"`)
 
@@ -523,6 +529,8 @@ The DigitalOcean droplet was disabled for non-payment (DO Spaces bucket lost wit
 | Frontmatter YAML escaping | **Latent bug**: `vault.py::_yaml_list()` escaped internal `"` but never wrapped list items in quotes at all, and `summary:` interpolated the LLM's first sentence with zero escaping. Any alias/tag/summary containing `?`, `:`, `#`, a bare comma, or an internal quote (all routine in raw Instagram captions) silently corrupted that note's frontmatter — found via a full-vault YAML validity sweep, not by the pipeline itself. | **Fixed**: `_yaml_list()` now double-quotes every item; `summary_line` escapes internal quotes. `vault_writer.py::_parse_frontmatter()`'s regex had a second-order bug this exposed — its bare-item fallback branch didn't exclude quote characters, so once items were *correctly* quoted it would swallow straight through a later item's opening quote as literal text. Fixed by excluding `"`/`'` from that branch; verified backward-compatible with the ~470 pre-existing unquoted-style notes. |
 | Local LaunchAgents | All four (`nexus-crystallizer`, `dev.nexus.vault-writer`, `nexus-index`, plus `stealth_crystallizer.sh`'s internal path) still pointed at a project path (`~/MSAI/...`) deleted months earlier by an unrelated folder rename — silently failing on every scheduled respawn since. Discovered only because nothing had auto-synced since Aug 19. | Fixed: plists + script repointed at the current path (`~/Ireland/...`), reloaded — confirmed running clean with live PIDs. |
 | Vault content quality | 165 broken links, 326 notes missing `summary:`, 77 tag format violations, 11 under-synthesized notes (raw fragments or "Source Anchors (Unsynthesized)" dumps), 8 files with corrupted YAML | One-off cleanup pass (backed up first): links pruned (not auto-renamed — fuzzy matching tested unreliable), tags normalized, summaries backfilled via a cheap Gemini pass, under-synthesis fixed by resynthesizing from the linked Source note, YAML corruption fixed. 44 `domain/` tag misclassifications and 56 orphaned notes deliberately left for manual judgment — not mechanical fixes. |
+| Seedling backlog recovery | One-time startup scan only — a seedling whose first processing attempt failed (e.g. Ollama not ready yet at login/wake, a real race) sat stuck with no further retry until the next full daemon restart. Found via a real seedling stuck since 2026-08-24. | `_rescan_seedling_backlog()` (§3) also runs every 5 minutes from the tick loop, not just at startup — same dedup-safe re-queue logic (skips anything already processing or done), just periodic |
+| Stage 2 model routing (documentation drift) | §4 described 9B/MLX fast-path routing for short content as current behavior | Corrected: MLX has been disabled since an undiagnosed startup crash (`mlx_lm` SIGSEGV) — every local capture currently takes the 14B/Ollama path regardless of size. Not fixed this round, just accurately documented — `_mlx_generate` is intact and would resume working if the routing lockout in `watcher.py` were lifted. |
 
 ---
 

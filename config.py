@@ -57,6 +57,26 @@ class Config:
     # output fails to parse — see _select_gemini_synthesis_model() in processor.py.
     gemini_synthesis_model_quality: str = os.getenv("GEMINI_SYNTHESIS_MODEL_QUALITY", "gemini-3.1-pro-preview")
 
+    # ── Gemini cost tracker ────────────────────────────────────
+    # $ per 1M tokens, keyed by pipeline role (not an exact per-model rate card —
+    # these are estimates calibrated against the one real measured benchmark we
+    # have, docs/architecture.md's "~$0.022/capture, cheap tier, 6,482 in/4,690
+    # out incl. thinking" test. The relay's cached/uncached input split IS a
+    # documented real rate (see processor.py's context-cache comment); the rest
+    # are directional. Reconcile periodically against aistudio.google.com/spend
+    # and correct via env vars if your actual billing differs — every
+    # _gemini_generate() call logs to cost_log_path regardless of accuracy here,
+    # so historical entries can be re-priced later if these defaults were off.
+    gemini_relay_price_in: float = float(os.getenv("GEMINI_RELAY_PRICE_IN", "0.025"))            # cached
+    gemini_relay_price_in_uncached: float = float(os.getenv("GEMINI_RELAY_PRICE_IN_UNCACHED", "0.25"))
+    gemini_relay_price_out: float = float(os.getenv("GEMINI_RELAY_PRICE_OUT", "0.30"))
+    gemini_cheap_price_in: float = float(os.getenv("GEMINI_CHEAP_PRICE_IN", "0.15"))
+    gemini_cheap_price_out: float = float(os.getenv("GEMINI_CHEAP_PRICE_OUT", "4.50"))
+    gemini_quality_price_in: float = float(os.getenv("GEMINI_QUALITY_PRICE_IN", "1.25"))
+    gemini_quality_price_out: float = float(os.getenv("GEMINI_QUALITY_PRICE_OUT", "10.00"))
+    # JSONL append-log, one line per Gemini call — read by GET /costs in server.py.
+    cost_log_path: str = os.getenv("COST_LOG_PATH", str(Path.home() / ".nexus_cost_log.jsonl"))
+
     # ── Groq (explicit text-only fallback) ────────────────────
     groq_api_key: str = os.getenv("GROQ_API_KEY", "")
     groq_model: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")

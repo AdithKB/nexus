@@ -12,6 +12,7 @@ V4.0 (March 2026) Sovereign Optimization:
 import asyncio
 import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -931,6 +932,67 @@ async def _ollama_generate(prompt: str, system: str, config: Config) -> Tuple[st
         return content, usage
 
 
+def _gemini_pricing_for_model(model: str) -> Tuple[float, float, float]:
+    """
+    (price_in_per_1M, price_in_cached_per_1M, price_out_per_1M) for a given
+    model name, read live from env vars (not a passed-in Config — _gemini_generate
+    is called from several places that only carry a model string, not a full
+    Config instance; reading the same env vars config.py defines keeps both in
+    sync without threading a Config object through every call site).
+    """
+    relay_in = float(os.getenv("GEMINI_RELAY_PRICE_IN", "0.025"))
+    relay_in_uncached = float(os.getenv("GEMINI_RELAY_PRICE_IN_UNCACHED", "0.25"))
+    relay_out = float(os.getenv("GEMINI_RELAY_PRICE_OUT", "0.30"))
+    cheap_in = float(os.getenv("GEMINI_CHEAP_PRICE_IN", "0.15"))
+    cheap_out = float(os.getenv("GEMINI_CHEAP_PRICE_OUT", "4.50"))
+    quality_in = float(os.getenv("GEMINI_QUALITY_PRICE_IN", "1.25"))
+    quality_out = float(os.getenv("GEMINI_QUALITY_PRICE_OUT", "10.00"))
+
+    if "flash-lite" in model:
+        return relay_in_uncached, relay_in, relay_out
+    if "pro" in model:
+        return quality_in, quality_in, quality_out
+    return cheap_in, cheap_in, cheap_out  # default: flash-tier synthesis
+
+
+def _log_gemini_cost(model: str, usage: dict) -> float:
+    """
+    Compute cost for one _gemini_generate() call and append it to the cost
+    log (JSONL, one line per call) for GET /costs to aggregate. Best-effort —
+    a logging failure must never break the actual capture.
+    """
+    price_in, price_in_cached, price_out = _gemini_pricing_for_model(model)
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    cached_tokens = usage.get("cached_tokens", 0)
+    uncached_prompt = max(0, prompt_tokens - cached_tokens)
+
+    cost = (
+        uncached_prompt * price_in / 1_000_000
+        + cached_tokens * price_in_cached / 1_000_000
+        + output_tokens * price_out / 1_000_000
+    )
+
+    try:
+        import json as _json
+        log_path = os.getenv("COST_LOG_PATH", str(Path.home() / ".nexus_cost_log.jsonl"))
+        entry = {
+            "ts": time.time(),
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+            "output_tokens": output_tokens,
+            "cached_tokens": cached_tokens,
+            "total_tokens": usage.get("total_tokens", 0),
+            "cost_usd": round(cost, 6),
+        }
+        with open(log_path, "a") as f:
+            f.write(_json.dumps(entry) + "\n")
+    except Exception as e:
+        print(f"[COST] Log write failed (non-fatal): {e}", flush=True)
+
+    return cost
+
+
 async def _gemini_generate(
     prompt: str,
     system: str,
@@ -985,9 +1047,12 @@ async def _gemini_generate(
     usage: dict = {}
     if response.usage_metadata:
         usage = {
+            "prompt_tokens": response.usage_metadata.prompt_token_count or 0,
+            "output_tokens": response.usage_metadata.candidates_token_count or 0,
+            "cached_tokens": getattr(response.usage_metadata, "cached_content_token_count", 0) or 0,
             "total_tokens": response.usage_metadata.total_token_count or 0,
-            "cached_tokens": getattr(response.usage_metadata, "cached_content_token_count", 0),
         }
+        usage["cost_usd"] = _log_gemini_cost(model, usage)
 
     return response.text, usage
 

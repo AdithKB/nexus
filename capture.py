@@ -172,21 +172,26 @@ async def run_pipeline(
         info(f"Suggested MOCs: {', '.join(result.suggested_mocs)}")
 
     # Token usage + cost
+    # NOTE: this was silently always $0.00 for Gemini runs until 2026-10-15 —
+    # read mismatched dict keys ("input_tokens"/"output_tokens") that
+    # _gemini_generate() never actually set (it only ever returned
+    # "total_tokens"/"cached_tokens"). Fixed alongside the cost-tracker work:
+    # _gemini_generate() now returns "prompt_tokens"/"output_tokens" plus a
+    # precomputed "cost_usd" (same per-model pricing used by GET /costs on the
+    # relay server), so this just displays what's already been logged rather
+    # than recomputing its own (differently-priced) estimate.
     cost_str = ""
     total_tokens = 0
     if result.token_usage:
         t = result.token_usage
         total_tokens = t.get("total_tokens", 0)
         info(
-            f"Tokens: {t.get('input_tokens', '?')} in → "
+            f"Tokens: {t.get('prompt_tokens', '?')} in → "
             f"{t.get('output_tokens', '?')} out "
             f"({total_tokens:,} total)"
         )
         if config.llm_provider == "gemini":
-            cost = (
-                t.get("input_tokens", 0) * 0.15 / 1_000_000
-                + t.get("output_tokens", 0) * 0.60 / 1_000_000
-            )
+            cost = t.get("cost_usd", 0.0)
             cost_str = f"${cost:.4f}"
             info(f"Est. cost: {cost_str}")
         elif config.llm_provider in ("groq", "ollama"):

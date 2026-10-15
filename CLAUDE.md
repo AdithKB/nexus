@@ -21,6 +21,9 @@ Captures URLs/PDFs/voice/text → Gemini extraction (Stage 1) → local Qwen3 sy
 - **Vault-quality "fixes" need testing before batch-applying.** A naive body-length heuristic for "under-synthesized notes" produced 145 false positives out of 483 (concise ≠ broken); fuzzy-matching for broken-link repair produced wrong retargets. Always dry-run a heuristic against known-good and known-bad examples before writing to 483 real files.
 - **`watcher.py`'s filesystem watch only fires on new events — a seedling that already existed before the daemon started won't trigger it.** The one-time startup scan covers most of this, but if that single attempt fails (Ollama not ready yet at login/wake is a real race), nothing retried it before — it just sat there. Fixed by making `_rescan_seedling_backlog()` also run every 5 minutes from the tick loop, not just at startup. Found via a real seedling stuck since 2026-08-24.
 - **Local synthesis is currently 14B/Ollama-only — the 9B/MLX fast path is disabled**, not routing-dependent as `docs/architecture.md` §4 used to describe. `mlx_lm` crashes on import on this machine (never root-caused); `watcher.py` hardcodes the quality-tier model for every seedling regardless of content size. Every local capture is slower than the docs implied, but this is a known, intentional lockout, not a new bug.
+- **`anchors_recovered` (the integrity gate's "did synthesis drop a required fact" signal) used to be invisible for the cloud path.** `watcher.py` always logged it locally; `server.py`'s cloud branch silently dropped it. Fixed 2026-10-15 — now logged server-side (`[JOB ...] CLOUD: Stage 2 complete ... N anchors recovered`, plus a `[QUALITY]` warning at ≥5) and included in the `/result/{job_id}` JSON (`anchors_recovered`, `model_used`). Note this signal only catches *lost* information, not *thin source material* — a reel with almost no real caption will still produce a thin note with `anchors_recovered: 0`, correctly, since there was nothing to lose.
+- **`capture.py`'s local "Est. cost" display was silently always `$0.00` for Gemini runs**, not just free-tier providers — it read `t.get("input_tokens"...)`/`t.get("output_tokens"...)` but `_gemini_generate()` only ever populated `total_tokens`/`cached_tokens`, so the lookups always missed and the formula multiplied by zero. Found while building the cost tracker (below), fixed 2026-10-15 alongside it — `capture.py` now just displays the `cost_usd` `_gemini_generate()` computes itself, rather than recomputing its own (differently-priced, broken) estimate.
+- **Cost tracker added 2026-10-15**: every `_gemini_generate()` call (Stage 1 relay *and* Stage 2 synthesis, local-path and cloud-path alike — Stage 1 always runs through Gemini regardless of where Stage 2 runs) now appends one line to a JSONL log (`COST_LOG_PATH`, default `~/.nexus_cost_log.jsonl` — separate files on the Mac and the VM, since both run real Gemini calls independently). `GET /costs` on the relay server aggregates it (total, last-N-days, today, per-model breakdown). Pricing (`config.py`'s `GEMINI_*_PRICE_*` env vars) is an **estimate** calibrated against the one real documented benchmark (`docs/architecture.md`'s $0.022/cheap-capture figure — computed cost from the calibration input came out to $0.0221, close enough to trust directionally) — not a verified rate card for these specific preview models. Reconcile periodically against `aistudio.google.com/spend`; `/costs`' response includes `"pricing_is_estimate": true` as a standing reminder, and every log line keeps its raw token counts so entries can be re-priced later if the defaults turn out to be off.
 
 ## Useful commands
 
@@ -36,6 +39,9 @@ python vault_writer.py --once
 
 # Check relay server health
 curl https://nexus.adithkb.dev/health
+
+# Gemini cost tracker — total/today/per-model, estimate (see note above)
+curl https://nexus.adithkb.dev/costs
 ```
 
 ## Secrets

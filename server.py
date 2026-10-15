@@ -19,6 +19,7 @@ Usage:
 import argparse
 import asyncio
 import json as _json
+import os
 import re
 import time
 import uuid
@@ -418,9 +419,20 @@ async def _process_job(job_id: str, url: str, config, user_intent: str = ""):
 
                 print(
                     f"[JOB {job_id}] CLOUD: Stage 2 complete via Gemini — "
-                    f"{len(result.atomic_notes)} notes, {uploaded} file(s) uploaded.",
+                    f"{len(result.atomic_notes)} notes, {uploaded} file(s) uploaded, "
+                    f"{result.anchors_recovered} anchors recovered.",
                     flush=True,
                 )
+                # Mirrors watcher.py's local-path QUALITY warning — previously only the
+                # local path surfaced this at all, so a dropped-anchor cloud capture was
+                # invisible outside of manually diffing frontmatter.
+                if result.anchors_recovered >= 5:
+                    print(
+                        f"[QUALITY] ⚠ [JOB {job_id}] {result.anchors_recovered} anchors recovered "
+                        f"by integrity gate (model: {result.model_used}). Consider re-running with "
+                        f"the quality tier.",
+                        flush=True,
+                    )
 
                 if _dedup_gate and meta.transcript:
                     _dedup_gate.index(url, meta.transcript[:4000], title=meta.title or url)
@@ -431,6 +443,8 @@ async def _process_job(job_id: str, url: str, config, user_intent: str = ""):
                         "status": "captured",
                         "url": url,
                         "notes_created": len(result.atomic_notes),
+                        "anchors_recovered": result.anchors_recovered,
+                        "model_used": result.model_used,
                         "provider": "gemini",
                         "error": None,
                     },
@@ -497,6 +511,83 @@ async def _process_job(job_id: str, url: str, config, user_intent: str = ""):
 def health():
     """Liveness check."""
     return {"status": "ok", "service": "obsidian-capture-pipeline"}
+
+
+@app.get("/costs")
+def costs(days: int = 30):
+    """
+    Gemini cost tracker — aggregates processor.py's per-call JSONL log
+    (every _gemini_generate() call writes one line there, Stage 1 relay and
+    Stage 2 synthesis alike, cloud-path and local-path both since Stage 1
+    always runs through Gemini regardless of where Stage 2 synthesis runs).
+
+    Pricing is an estimate (see config.py's GEMINI_*_PRICE_* env vars) —
+    reconcile against aistudio.google.com/spend for the real figure. This
+    exists so you don't have to log into AI Studio just to sanity-check
+    whether a batch of captures is cheap or not.
+    """
+    log_path = os.getenv("COST_LOG_PATH", str(Path.home() / ".nexus_cost_log.jsonl"))
+    if not os.path.exists(log_path):
+        return {"total_usd": 0.0, "calls": 0, "note": "no cost log yet — nothing has run since this endpoint was added"}
+
+    now = time.time()
+    cutoff_window = now - days * 86400
+    today_start = now - (now % 86400)  # UTC midnight-ish, fine for a rough "today" bucket
+
+    total = {"usd": 0.0, "calls": 0, "tokens": 0}
+    windowed = {"usd": 0.0, "calls": 0, "tokens": 0}
+    today = {"usd": 0.0, "calls": 0, "tokens": 0}
+    by_model: dict = {}
+
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = _json.loads(line)
+            except Exception:
+                continue
+            cost = e.get("cost_usd", 0.0)
+            tok = e.get("total_tokens", 0)
+            model = e.get("model", "unknown")
+
+            total["usd"] += cost
+            total["calls"] += 1
+            total["tokens"] += tok
+
+            if e.get("ts", 0) >= cutoff_window:
+                windowed["usd"] += cost
+                windowed["calls"] += 1
+                windowed["tokens"] += tok
+
+            if e.get("ts", 0) >= today_start:
+                today["usd"] += cost
+                today["calls"] += 1
+                today["tokens"] += tok
+
+            m = by_model.setdefault(model, {"usd": 0.0, "calls": 0, "tokens": 0})
+            m["usd"] += cost
+            m["calls"] += 1
+            m["tokens"] += tok
+
+    for bucket in (total, windowed, today):
+        bucket["usd"] = round(bucket["usd"], 4)
+    for m in by_model.values():
+        m["usd"] = round(m["usd"], 4)
+
+    return {
+        "total_usd": total["usd"],
+        "total_calls": total["calls"],
+        "total_tokens": total["tokens"],
+        f"last_{days}_days_usd": windowed["usd"],
+        f"last_{days}_days_calls": windowed["calls"],
+        "today_usd": today["usd"],
+        "today_calls": today["calls"],
+        "by_model": by_model,
+        "pricing_is_estimate": True,
+        "log_path": log_path,
+    }
 
 
 @app.post("/index")

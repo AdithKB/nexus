@@ -459,6 +459,18 @@ Obsidian Vault (local iCloud Drive) → iCloud sync → iPhone Obsidian app
 
 ---
 
+## 18a. Gemini Cost Tracking
+
+Added 2026-10-15. Every `processor.py::_gemini_generate()` call — Stage 1 relay *and* Stage 2 synthesis, local-path and cloud-path alike (Stage 1 always runs through Gemini regardless of where Stage 2 synthesis happens) — appends one line to a JSONL log at `COST_LOG_PATH` (default `~/.nexus_cost_log.jsonl`; the Mac and the Oracle VM each keep their own, since both make real Gemini calls independently). Each line: timestamp, model, prompt/output/cached/total tokens, computed `cost_usd`.
+
+`GET /costs` on the relay server aggregates it — total spend, last-N-days (default 30, `?days=`), today, and a per-model breakdown. Exists so a batch of captures can be sanity-checked without logging into Google AI Studio.
+
+**Pricing is an estimate**, not a verified rate card (`config.py`'s `GEMINI_RELAY_PRICE_*` / `GEMINI_CHEAP_PRICE_*` / `GEMINI_QUALITY_PRICE_*` env vars — one rate pair per pipeline role, relay/cheap-synthesis/quality-synthesis). The relay's cached-vs-uncached input split is a real documented rate (§3, the context-caching comment: $0.025/1M cached vs $0.25/1M uncached); everything else was back-calibrated against the one real measured benchmark in §4a ($0.022/cheap-capture, 6,482 in/4,690 out) — plugging that benchmark's token counts through the calibrated rates lands at $0.0221, close enough to trust directionally. `/costs`' response carries `"pricing_is_estimate": true` as a standing reminder; reconcile against `aistudio.google.com/spend` periodically, and correct the env vars if real billing diverges — raw token counts stay in every log line either way, so past entries can be re-priced later without re-running anything.
+
+`capture.py`'s local "Est. cost" display had been silently stuck at `$0.00` for every Gemini-provider run before this — it read dict keys (`input_tokens`/`output_tokens`) that `_gemini_generate()` never actually set. Fixed alongside this work; it now just displays the `cost_usd` the shared pricing logic already computed.
+
+---
+
 ## 19. Active Monitoring Signals
 
 | Signal | Location | Action threshold |
@@ -472,6 +484,7 @@ Obsidian Vault (local iCloud Drive) → iCloud sync → iPhone Obsidian app
 | Dedup gate | `[JOB]` log | "Duplicate content. Matched: [...]" |
 | Dream session | `~/.nexus_dream_state.json` | `latent_links_added`, `orphans_rescued` |
 | Sync log | `~/.nexus-sync.log` | Rotated at 5 MB, 3 backups |
+| Gemini cost | `GET /costs` (relay) or `~/.nexus_cost_log.jsonl` | Estimate — reconcile against aistudio.google.com/spend (§18a) |
 
 ---
 

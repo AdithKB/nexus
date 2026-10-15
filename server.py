@@ -417,10 +417,16 @@ async def _process_job(job_id: str, url: str, config, user_intent: str = ""):
                 files = build_vault_files(result, meta, config)
                 uploaded = await _upload_to_spaces(files, config)
 
+                # Stage 2 only — Stage 1 relay cost isn't threaded back through
+                # run_relay_stage()'s return (it's still logged in the aggregate
+                # cost log either way, just not attributable to this job_id here).
+                # Relay cost is consistently small (~$0.0003/call on real data so
+                # far), so this slightly undercounts rather than misleads.
+                synthesis_cost = (result.token_usage or {}).get("cost_usd", 0.0)
                 print(
                     f"[JOB {job_id}] CLOUD: Stage 2 complete via Gemini — "
                     f"{len(result.atomic_notes)} notes, {uploaded} file(s) uploaded, "
-                    f"{result.anchors_recovered} anchors recovered.",
+                    f"{result.anchors_recovered} anchors recovered, ~${synthesis_cost:.4f} synthesis cost.",
                     flush=True,
                 )
                 # Mirrors watcher.py's local-path QUALITY warning — previously only the
@@ -445,6 +451,7 @@ async def _process_job(job_id: str, url: str, config, user_intent: str = ""):
                         "notes_created": len(result.atomic_notes),
                         "anchors_recovered": result.anchors_recovered,
                         "model_used": result.model_used,
+                        "synthesis_cost_usd": round(synthesis_cost, 6),
                         "provider": "gemini",
                         "error": None,
                     },

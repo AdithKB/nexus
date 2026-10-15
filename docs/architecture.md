@@ -56,6 +56,16 @@ Fleeting notes bypass Stage 1 and Stage 2 entirely. vault_writer routes `incomin
 
 Full pipeline path for audio: Groq Whisper transcription → `run_relay_stage` → seedling → Spaces. Uses `user_intent` for Stage 2 framing.
 
+### 2g. Instagram DM Capture → `/webhooks/instagram`
+
+Added 2026-10-15. Share a reel directly to a dedicated bot Instagram account's DM instead of using the iOS Shortcut — modeled on how the product Nylo (`@heynylo`) works. Meta POSTs the share event to `/webhooks/instagram` → `instagram_webhook.py::extract_shared_url()` pulls the permalink out of the `message.attachments[].payload.url` field (or a text-URL fallback) → `_process_job()` runs it through the identical full-cloud path `/capture`'s cloud branch uses (forced `provider="gemini"`, same `_job_semaphore`, same dedup gate) → lands in the vault exactly like any other cloud capture. **Purely additive** — every existing input path (§2a-2f) is unchanged; this is a new front door onto the same pipeline, not a new pipeline.
+
+Integration chosen: **"Instagram API with Instagram Login"**, not the older Facebook-Page-linked flow — no Page required, matches a single personal bot account. `GET /webhooks/instagram` handles Meta's one-time subscribe handshake (echoes `hub.challenge`); `POST /webhooks/instagram` verifies `X-Hub-Signature-256` (HMAC-SHA256 against `META_APP_SECRET`) before touching the payload, then queues via `BackgroundTask` — Meta disables delivery after repeated slow/non-200 responses, so the handler stays symmetric with every other route here (verify + queue fast, do the real work after the response goes out).
+
+Security: `INSTAGRAM_ALLOWED_SENDER_ID` restricts processing to the account owner's own IGSID — the webhook signature proves Meta sent the request, not that the owner sent the share. Optional ack-reply (confirming receipt via DM, matching Nylo's UX) is gated behind `INSTAGRAM_ACK_REPLY_ENABLED` (default off) — core capture works with zero reply.
+
+**Flagged as unverified pre-feature, confirm live**: the exact `ig_post` webhook payload shape (Meta changed the attachment type from `share` to `ig_post` on 2025-10-30; `extract_shared_url()` is deliberately written to check for a `url` field rather than gate on the type string, so it survives Meta renaming this again) and whether this single-user setup is covered by Standard Access without formal App Review.
+
 ---
 
 ## 3. Two-Stage Pipeline
@@ -544,6 +554,8 @@ The DigitalOcean droplet was disabled for non-payment (DO Spaces bucket lost wit
 | Vault content quality | 165 broken links, 326 notes missing `summary:`, 77 tag format violations, 11 under-synthesized notes (raw fragments or "Source Anchors (Unsynthesized)" dumps), 8 files with corrupted YAML | One-off cleanup pass (backed up first): links pruned (not auto-renamed — fuzzy matching tested unreliable), tags normalized, summaries backfilled via a cheap Gemini pass, under-synthesis fixed by resynthesizing from the linked Source note, YAML corruption fixed. 44 `domain/` tag misclassifications and 56 orphaned notes deliberately left for manual judgment — not mechanical fixes. |
 | Seedling backlog recovery | One-time startup scan only — a seedling whose first processing attempt failed (e.g. Ollama not ready yet at login/wake, a real race) sat stuck with no further retry until the next full daemon restart. Found via a real seedling stuck since 2026-08-24. | `_rescan_seedling_backlog()` (§3) also runs every 5 minutes from the tick loop, not just at startup — same dedup-safe re-queue logic (skips anything already processing or done), just periodic |
 | Stage 2 model routing (documentation drift) | §4 described 9B/MLX fast-path routing for short content as current behavior | Corrected: MLX has been disabled since an undiagnosed startup crash (`mlx_lm` SIGSEGV) — every local capture currently takes the 14B/Ollama path regardless of size. Not fixed this round, just accurately documented — `_mlx_generate` is intact and would resume working if the routing lockout in `watcher.py` were lifted. |
+| Gemini cost tracking | Per-job cost silently invisible — `capture.py`'s local "Est. cost" display always computed `$0.00` for Gemini runs (read dict keys `_gemini_generate()` never populated); cloud path's `anchors_recovered` quality signal only ever logged locally, never server-side | New: every `_gemini_generate()` call logs real token counts + computed cost to a JSONL log (§18a); `GET /costs` aggregates it; `GET /result/{job_id}` now also surfaces `anchors_recovered`/`model_used`/`synthesis_cost_usd` for cloud jobs. Pricing is a calibrated estimate, not Google's verified rate card — `cost_tracker.py` separately reads the real billed figure from the Cloud Billing BigQuery export once linked (Console-only step, no API/CLI path exists), surfaced alongside the estimate on the Obsidian Dashboard via `vault_writer.py::update_cost_summary()`. |
+| Instagram DM capture bot (§2g) | Only ingestion path was the iOS Shortcut — any capture needed the URL copied into the share sheet manually | **Additive**, not a replacement: new `GET`/`POST /webhooks/instagram` routes + `instagram_webhook.py` (signature verification, `ig_post`/`share`-type-agnostic payload parsing) feed the identical `_process_job()` full-cloud path `/capture`'s cloud branch already uses. Chose "Instagram API with Instagram Login" over the Facebook-Page-linked alternative — no Page required. Verified end-to-end locally (FastAPI TestClient: handshake accept/reject, signature accept/reject, a real `_process_job` call through to Gemini) before any Meta account existed; blocked on the user's Meta Developer Console setup for a live test against a real share. |
 
 ---
 
@@ -561,7 +573,9 @@ The DigitalOcean droplet was disabled for non-payment (DO Spaces bucket lost wit
 | `dreamer.py` | Dreamer Agent — LazyGraphRAG autonomous vault maintenance (nightly, zero LLM) |
 | `compressor.py` | LexRank transcript compression |
 | `watcher.py` | Stage 2 daemon — watchdog, model routing, thermal guard, research loop, Dreamer trigger |
-| `server.py` | FastAPI relay — `/capture`, `/capture_smart`, `/capture_voice`, `/capture_voice_fleeting`, `/capture_text`, `/capture_file`, `/research_topic` |
+| `server.py` | FastAPI relay — `/capture`, `/capture_smart`, `/capture_voice`, `/capture_voice_fleeting`, `/capture_text`, `/capture_file`, `/research_topic`, `/webhooks/instagram`, `/costs` |
+| `instagram_webhook.py` | Instagram DM capture bot — webhook signature verification, `ig_post`/`share`-type-agnostic payload parsing (§2g) |
+| `cost_tracker.py` | Real GCP billing reconciliation — reads the Cloud Billing BigQuery export once linked (§18a) |
 | `vault_writer.py` | Polls the relay server's `/pending`; routes seedlings/research/fleeting/markdown to vault |
 | `mcp_nexus.py` | MCP server v1.6 — search, graph, research, write tools, `nexus://` resources |
 | `reflector_tier1.py` | Post-capture vault audit — broken links, tag violations, orphans, cycles; `--fix`/`--prune`/`--harmonize`/`--recover`/`--split` for automated maintenance |

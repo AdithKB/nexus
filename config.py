@@ -161,6 +161,23 @@ class Config:
     # If blank, Instagram extraction falls back to yt-dlp (text-only on VPS).
     apify_api_key: str = os.getenv("APIFY_API_KEY", "")
 
+    # ── Instagram DM Capture Bot ───────────────────────────────
+    # Share a reel to a dedicated bot Instagram account instead of using the
+    # iOS Shortcut — see docs/architecture.md §2g. Setup: "Instagram API with
+    # Instagram Login" at developers.facebook.com (no linked Facebook Page
+    # needed), permission instagram_business_manage_messages.
+    meta_app_secret: str = os.getenv("META_APP_SECRET", "")
+    instagram_webhook_verify_token: str = os.getenv("INSTAGRAM_WEBHOOK_VERIFY_TOKEN", "")
+    instagram_access_token: str = os.getenv("INSTAGRAM_ACCESS_TOKEN", "")
+    instagram_bot_user_id: str = os.getenv("INSTAGRAM_BOT_USER_ID", "")
+    # Webhook signature proves Meta sent the request, not that YOU sent the
+    # share — set this to your personal IGSID (surfaced in the first real
+    # webhook payload's sender.id) once known. Blank = accept from anyone,
+    # fine only during initial payload-shape calibration.
+    instagram_allowed_sender_id: str = os.getenv("INSTAGRAM_ALLOWED_SENDER_ID", "")
+    # Phase 2 — off by default; core capture works with zero DM reply.
+    instagram_ack_reply_enabled: bool = os.getenv("INSTAGRAM_ACK_REPLY_ENABLED", "false").lower() == "true"
+
     # ── Semantic Dedup Gate (Model2Vec potion-base-2M, 8 MB) ─
     dedup_enabled: bool = True
     dedup_skip_threshold: float = 0.92   # sim >= this → skip (duplicate content)

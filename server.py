@@ -36,13 +36,14 @@ except ImportError:
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
 from capture import _c, build_config, run_pipeline
 from embed_store import EmbedStore
 from extractors import extract_source
+from instagram_webhook import extract_messaging_events, extract_shared_url, send_ack_reply, verify_signature
 from processor import run_relay_stage, run_crystallizer_stage
 from vault import build_vault_files
 
@@ -813,6 +814,100 @@ async def _put_seedling_to_spaces(job_id: str, seedling_text: str, config) -> bo
     except Exception as e:
         print(f"[SEEDLING {job_id}] Spaces upload failed: {e}", flush=True)
         return False
+
+
+@app.get("/webhooks/instagram")
+async def instagram_webhook_verify(request: Request):
+    """
+    Meta's one-time subscribe handshake — echo back hub.challenge if
+    hub.verify_token matches INSTAGRAM_WEBHOOK_VERIFY_TOKEN. Run once per
+    webhook subscription setup in the Meta developer console, not per
+    message (see docs/architecture.md §2g).
+    """
+    cfg = build_config()
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge", "")
+
+    if mode == "subscribe" and cfg.instagram_webhook_verify_token and token == cfg.instagram_webhook_verify_token:
+        print("[IG_WEBHOOK] Handshake verified", flush=True)
+        return PlainTextResponse(challenge, status_code=200)
+
+    print(f"[IG_WEBHOOK] Handshake FAILED (mode={mode!r})", flush=True)
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+
+@app.post("/webhooks/instagram")
+async def instagram_webhook_receive(request: Request):
+    """
+    Meta delivers a share-to-DM event here. Instagram DM Capture Bot —
+    additive ingestion surface alongside the iOS Shortcut; feeds the exact
+    same full-cloud _process_job() path as /capture's cloud branch, nothing
+    about the existing capture paths changes. See docs/architecture.md §2g.
+
+    Must ack fast (Meta retries/eventually disables delivery after repeated
+    slow or non-200 responses) — do only the minimum synchronous work here
+    (verify signature, parse, queue job bookkeeping) and push the actual
+    pipeline work into a BackgroundTask, same pattern as every other route
+    in this file.
+    """
+    raw_body = await request.body()
+    cfg = build_config()
+
+    sig_header = request.headers.get("x-hub-signature-256", "")
+    if not verify_signature(raw_body, sig_header, cfg.meta_app_secret):
+        print("[IG_WEBHOOK] Signature verification FAILED — rejecting", flush=True)
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    try:
+        payload = _json.loads(raw_body)
+    except Exception:
+        print("[IG_WEBHOOK] Non-JSON body received, ignoring", flush=True)
+        return JSONResponse({"status": "ignored"})
+
+    # Calibration logging — the exact ig_post payload shape isn't confirmed
+    # against a real share yet (see docs/architecture.md §2g). Keep this on
+    # until confirmed stable across a few real shares; cheap to leave on
+    # indefinitely after that.
+    print(f"[IG_WEBHOOK RAW] {_json.dumps(payload)[:4000]}", flush=True)
+
+    queued: list[tuple[str, str, object, str]] = []  # (job_id, url, config, sender_id)
+    for ev in extract_messaging_events(payload):
+        sender_id = (ev.get("sender") or {}).get("id", "")
+
+        if cfg.instagram_allowed_sender_id and sender_id != cfg.instagram_allowed_sender_id:
+            print(f"[IG_WEBHOOK] Ignoring sender {sender_id!r} (not allowlisted)", flush=True)
+            continue
+
+        url = extract_shared_url(ev)
+        if not url:
+            print(f"[IG_WEBHOOK] No shareable URL in event from {sender_id!r}", flush=True)
+            continue
+
+        # Force the full-cloud path exactly like /capture's cloud branch —
+        # must be provider="gemini" for _process_job's gemini branch.
+        gemini_config = build_config(provider="gemini")
+        if not gemini_config.gemini_api_key:
+            print(f"[IG_WEBHOOK] GEMINI_API_KEY not set — cannot process {url}", flush=True)
+            continue
+
+        job_id = f"ig_{uuid.uuid4().hex[:8]}"
+        _jobs[job_id] = {"status": "processing", "result": None}  # _process_job doesn't init this itself
+        print(f"[IG_WEBHOOK] Queued job {job_id} for {url} (sender={sender_id})", flush=True)
+        queued.append((job_id, url, gemini_config, sender_id))
+
+    async def _dispatch():
+        # Meta can batch >1 messaging event per payload — chain them; the
+        # shared _job_semaphore (limit 2) still bounds actual concurrency.
+        for job_id, url, gemini_config, sender_id in queued:
+            await _process_job(job_id, url, gemini_config, "")
+            if cfg.instagram_ack_reply_enabled and cfg.instagram_access_token:
+                result = (_jobs.get(job_id) or {}).get("result") or {}
+                ok = result.get("status") == "captured"
+                text = "Captured ✓" if ok else f"Capture failed: {result.get('error') or 'unknown error'}"
+                await send_ack_reply(sender_id, text, cfg.instagram_access_token)
+
+    return JSONResponse({"status": "ok"}, background=BackgroundTask(_dispatch))
 
 
 @app.post("/capture_text")

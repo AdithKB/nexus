@@ -38,6 +38,7 @@ AGENTS_FILE  = VAULT / "AGENTS.md"
 INDEX_PUSH_INTERVAL = 300   # seconds between index pushes (5 min)
 PULL_INTERVAL = 30          # seconds between /pending polls
 RELINK_INTERVAL = 3600      # seconds between retroactive link passes (1 hr)
+COST_SUMMARY_INTERVAL = 600 # seconds between _cost_summary.md refreshes (10 min)
 
 LOG_PATH = Path.home() / ".nexus-sync.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024   # 5 MB
@@ -202,6 +203,89 @@ def push_vault_index(client: httpx.Client) -> int:
         return 0
 
 
+# ── Cost summary ──────────────────────────────────────────────
+
+COST_SUMMARY_FILE = VAULT / "_cost_summary.md"
+
+
+def update_cost_summary(client: httpx.Client) -> None:
+    """
+    Write a vault note combining the live token-based cost estimate
+    (GET /costs on the relay server) with the real GCP-billed figure once the
+    BigQuery billing export starts flowing (cost_tracker.py — gracefully
+    None until the export is linked and the first daily cycle lands).
+    Dashboard.md embeds this note with ![[_cost_summary]].
+    """
+    estimate = None
+    try:
+        resp = client.get(f"{SERVER}/costs", timeout=10)
+        resp.raise_for_status()
+        estimate = resp.json()
+    except Exception as e:
+        print(f"[cost] Estimate fetch failed: {e}", flush=True)
+
+    real = None
+    try:
+        from cost_tracker import query_real_gemini_cost
+        real = query_real_gemini_cost()
+    except Exception as e:
+        print(f"[cost] Real billing query failed: {e}", flush=True)
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [
+        "---", "type: cost_summary", f"updated: {now}", "---", "",
+        "# 💰 Gemini Cost Summary", "",
+    ]
+
+    if estimate:
+        lines += [
+            f"**Live estimate** (instant, token-based — see `docs/architecture.md` §18a for pricing caveats) · updated {now}",
+            "",
+            "| Period | Cost |",
+            "|---|---|",
+            f"| Today | ${estimate.get('today_usd', 0):.4f} |",
+            f"| Last 30 days | ${estimate.get('last_30_days_usd', estimate.get('total_usd', 0)):.4f} |",
+            f"| All-time | ${estimate.get('total_usd', 0):.4f} |",
+            "",
+        ]
+        by_model = estimate.get("by_model", {})
+        if by_model:
+            lines += ["**By model (all-time):**", "", "| Model | Cost | Calls |", "|---|---|---|"]
+            for model, m in sorted(by_model.items(), key=lambda kv: -kv[1].get("usd", 0)):
+                lines.append(f"| {model} | ${m.get('usd', 0):.4f} | {m.get('calls', 0)} |")
+            lines.append("")
+    else:
+        lines += ["*Live estimate unavailable — relay server unreachable.*", ""]
+
+    if real:
+        lines += [
+            "---", "",
+            f"**Real GCP billing** (last {real['window_days']} days, reconciled as of {real['last_updated'][:16]}) — "
+            "the actual billed figure, not an estimate:",
+            "",
+            f"**Total: {real['total']} {real['currency']}**",
+            "",
+        ]
+        if real.get("by_service"):
+            lines += ["| Service | Cost |", "|---|---|"]
+            for svc, cost in real["by_service"].items():
+                lines.append(f"| {svc} | {cost} {real['currency']} |")
+            lines.append("")
+    else:
+        lines += [
+            "---", "",
+            "*Real GCP billing: not available yet — either the BigQuery export isn't linked in "
+            "Cloud Billing Console, or the first daily export cycle hasn't landed (Google's export "
+            "has no real-time guarantee and doesn't backfill). The live estimate above is current.*",
+            "",
+        ]
+
+    try:
+        COST_SUMMARY_FILE.write_text("\n".join(lines), encoding="utf-8")
+    except Exception as e:
+        print(f"[cost] Failed to write {COST_SUMMARY_FILE.name}: {e}", flush=True)
+
+
 # ── Pending notes ─────────────────────────────────────────────
 
 _MOC_NOTES_HEADER = "## Notes"
@@ -357,12 +441,14 @@ def main():
     with httpx.Client(timeout=httpx.Timeout(10.0, read=75.0)) as client:
         pull_pending_files(client)
         push_vault_index(client)
+        update_cost_summary(client)
 
         if args.once:
             return
 
         last_push = time.time()
         last_relink = time.time()
+        last_cost = time.time()
         
         print(f"[sync] Starting long-poll loop (latency: 0s)", flush=True)
         while True:
@@ -396,6 +482,9 @@ def main():
             if now - last_relink >= RELINK_INTERVAL:
                 relink_vault(client)
                 last_relink = now
+            if now - last_cost >= COST_SUMMARY_INTERVAL:
+                update_cost_summary(client)
+                last_cost = now
 
 
 if __name__ == "__main__":
